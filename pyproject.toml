@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "robot-vision-service"
+version = "0.1.0"
+description = "Off-Pi perception service for Robot-Computer-Vision. Runs on the Mac mini."
+requires-python = ">=3.10"
+
+# Base install is deliberately model-free: the API, its validation and its whole
+# test suite run on any machine with these four. Models are an extra, because
+# the thing you most often want to do without a GPU is develop the Pi client.
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+    "pillow>=10.0",
+    "numpy>=1.24",
+    "python-multipart>=0.0.9",
+]
+
+[project.optional-dependencies]
+# The real backend. macOS arm64 only in practice — torch picks up MPS there.
+models = [
+    "torch>=2.2",
+    "torchvision>=0.17",
+    "ultralytics>=8.1",          # AGPL-3.0 — see README, "Licensing"
+    "insightface>=0.7.3",        # pretrained packs are research/non-commercial
+    "onnxruntime>=1.17",
+    "transformers>=4.38",        # Depth Anything V2
+]
+dev = ["pytest>=7.0", "httpx>=0.27"]
+
+[tool.setuptools.packages.find]
+include = ["vision_service*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# so `pytest` just works from this directory with no PYTHONPATH incantation
+pythonpath = [".", "tests"]
