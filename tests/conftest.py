@@ -1,19 +1,16 @@
-"""Every test runs against the fake backend: no models, no GPU, no network.
+"""Every test runs against a stub backend (tests/stub_backend.py): no models,
+no GPU, no network.
 
-That is the point of the backend seam. If a change breaks the contract, this
-suite catches it on a laptop in under a second.
+If a change breaks the API contract, this suite catches it in about a second.
 """
 
 from __future__ import annotations
 
 import io
-import os
 
 import pytest
 from fastapi.testclient import TestClient
 from PIL import Image
-
-os.environ["VS_BACKEND"] = "fake"
 
 
 @pytest.fixture()
@@ -24,7 +21,15 @@ def client(tmp_path, monkeypatch):
 
     monkeypatch.setattr(settings_mod.settings, "gallery_path", tmp_path / "gallery.npz",
                         raising=False)
-    from vision_service.app import app
+    monkeypatch.setattr(settings_mod.settings, "plant_dir", tmp_path / "plants", raising=False)
+    monkeypatch.setattr(settings_mod.settings, "face_photo_dir", tmp_path / "faces", raising=False)
+    monkeypatch.setattr(settings_mod.settings, "slam_dir", tmp_path / "maps", raising=False)
+    monkeypatch.setattr(settings_mod.settings, "vlm_providers", "", raising=False)
+    import vision_service.app as app_mod
+    from stub_backend import build_stub_backend
+
+    monkeypatch.setattr(app_mod, "build_backend", build_stub_backend)
+    app = app_mod.app
 
     with TestClient(app) as c:
         yield c

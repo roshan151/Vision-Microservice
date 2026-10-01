@@ -4,14 +4,16 @@ from __future__ import annotations
 def test_healthz(client):
     body = client.get("/healthz").json()
     assert body["status"] == "ok"
-    assert body["backend"] == "fake"
+    assert body["backend"] == "test"
     assert body["queue_depth"] == 0
-    assert set(body["versions"]) == {"detect", "face", "depth"}
+    assert set(body["versions"]) == {"detect", "face", "depth", "plant"}
+    assert body["plants"] == {"embeddings": 0, "plants": 0}
+    assert body["vlm"] == []
 
 
 def test_models_endpoint(client):
     body = client.get("/v1/models").json()
-    assert body["backend"] == "fake"
+    assert body["backend"] == "test"
     assert isinstance(body["depth_is_metric"], bool)
 
 

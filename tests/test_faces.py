@@ -96,3 +96,30 @@ def test_match_rejects_wrong_dimension(client):
     r = client.post("/v1/faces/match", json={"embedding": [0.1] * 128})
     assert r.status_code == 422
     assert "dim" in r.json()["detail"]
+
+
+def test_multiple_faces_are_reported_and_refused_for_enrollment(client):
+    two = jpeg(400, 160, (200, 180, 170))       # stub: wide crop == two faces
+    r = client.post("/v1/faces/embed", files={"image": ("c.jpg", two, "image/jpeg")},
+                    data={"seq": 1})
+    assert r.json()["face_count"] == 2
+    r = client.post("/v1/faces/enroll", data={"label": "crowd"},
+                    files=[("images", ("a.jpg", two, "image/jpeg"))])
+    assert r.status_code == 422
+
+
+def test_enrolled_face_photos_are_saved_with_bboxes(client):
+    from vision_service.settings import settings
+    for _ in range(2):        # a second enroll continues the numbering
+        r = client.post("/v1/faces/enroll", data={"label": "roshan"},
+                        files=[("images", ("a.jpg", jpeg(200, 200, (10, 20, 30)), "image/jpeg"))])
+        assert r.status_code == 200
+    folder = settings.face_photo_dir / "roshan"
+    assert sorted(p.name for p in folder.glob("photo_*.png")) == ["photo_1.png", "photo_2.png"]
+    assert (folder / "bbox_1.txt").read_text() == "0.0 0.0 200.0 200.0"
+
+
+def test_face_label_cannot_escape_the_folder(client):
+    r = client.post("/v1/faces/enroll", data={"label": "../x"},
+                    files=[("images", ("a.jpg", jpeg(200, 200), "image/jpeg"))])
+    assert r.status_code == 422

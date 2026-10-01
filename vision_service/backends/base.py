@@ -1,8 +1,8 @@
 """What a backend has to provide, and the shapes it returns.
 
 Keeping this narrow is what lets the whole API be tested with no models
-installed and no GPU: `FakeBackend` satisfies the same protocol as the real
-one, so every route, validation path and error branch is exercised in CI.
+installed and no GPU: the test suite's stub (tests/stub_backend.py) satisfies
+the same protocols as the real backend.
 """
 
 from __future__ import annotations
@@ -25,6 +25,7 @@ class FaceEmbedding:
     embedding: np.ndarray                      # float32, L2-normalised
     face_bbox: tuple[float, float, float, float]
     quality: float                             # 0..1; the Pi discards below ~0.6
+    face_count: int = 1                        # faces in the image; >1 means ambiguous
 
 
 class Detector(Protocol):
@@ -38,6 +39,13 @@ class FaceEncoder(Protocol):
 
     def embed(self, image: np.ndarray) -> FaceEmbedding | None:
         """Largest face in the image, or None if there isn't one."""
+
+
+class PlantEncoder(Protocol):
+    model_version: str
+
+    def embed(self, image: np.ndarray) -> np.ndarray:
+        """Global appearance embedding of a plant crop (float32, L2-normalised)."""
 
 
 class DepthEstimator(Protocol):
@@ -55,11 +63,15 @@ class Backend:
     detector: Detector
     face: FaceEncoder
     depth: DepthEstimator
-    kind: str             # "real" | "fake" — surfaced by /healthz so you always know
+    kind: str             # "real" in the service; surfaced by /healthz and /v1/models
+    plant: PlantEncoder | None = None
 
     def versions(self) -> dict[str, str]:
-        return {
+        v = {
             "detect": self.detector.model_version,
             "face": self.face.model_version,
             "depth": self.depth.model_version,
         }
+        if self.plant is not None:
+            v["plant"] = self.plant.model_version
+        return v

@@ -1,4 +1,4 @@
-"""The real models: Ultralytics YOLO, InsightFace, Depth Anything V2.
+"""The real models: Ultralytics YOLO, InsightFace, Depth Anything V2, DINOv2.
 
 Everything here imports lazily and loads once at startup, because a model
 loaded per request is the difference between a 20 ms answer and a 3 s one, and
@@ -21,6 +21,13 @@ from ..settings import settings
 from .base import Backend, Detection, FaceEmbedding
 
 log = logging.getLogger(__name__)
+
+
+def _bgr(image: np.ndarray) -> np.ndarray:
+    """images.decode() yields RGB (Pillow); YOLO and InsightFace take numpy input
+    as OpenCV-style BGR. Feeding RGB silently swaps red and blue, which costs
+    accuracy without ever raising. Depth goes through PIL, so it keeps RGB."""
+    return np.ascontiguousarray(image[..., ::-1])
 
 
 def _resolve_device(requested: str) -> str:
@@ -61,7 +68,7 @@ class YoloDetector:
 
     def detect(self, image: np.ndarray, min_confidence: float) -> list[Detection]:
         results = self._model.predict(
-            image, imgsz=self._imgsz, conf=min_confidence,
+            _bgr(image), imgsz=self._imgsz, conf=min_confidence,
             device=self._device, verbose=False,
         )
         out: list[Detection] = []
@@ -94,7 +101,7 @@ class InsightFaceEncoder:
         log.info("face encoder ready: %s via %s", pack, providers[0])
 
     def embed(self, image: np.ndarray) -> FaceEmbedding | None:
-        faces = self._app.get(image)
+        faces = self._app.get(_bgr(image))
         if not faces:
             return None
         # Largest face wins. The Pi sends a crop it already believes is one
@@ -106,6 +113,7 @@ class InsightFaceEncoder:
             embedding=v,
             face_bbox=(x1, y1, x2, y2),
             quality=_face_quality(face, image, (x1, y1, x2, y2)),
+            face_count=len(faces),
         )
 
 
@@ -174,6 +182,35 @@ class DepthAnythingEstimator:
         return depths, confs
 
 
+class Dinov2PlantEncoder:
+    """Plant identity embedding: DINOv2's CLS token, L2-normalised.
+
+    Self-supervised DINOv2 features separate *individual objects* well (the
+    same pot and leaf layout from a new angle stays close), which is the
+    property plant re-identification needs. Input is RGB, straight from
+    images.decode() — the HF processor expects RGB, unlike YOLO/InsightFace.
+    """
+
+    def __init__(self, model_id: str, device: str) -> None:
+        import torch
+        from transformers import AutoImageProcessor, AutoModel
+
+        self._torch = torch
+        self._device = device
+        self._proc = AutoImageProcessor.from_pretrained(model_id)
+        self._model = AutoModel.from_pretrained(model_id).to(device).eval()
+        self.model_version = model_id.split("/")[-1]
+        self.embed(np.zeros((224, 224, 3), dtype=np.uint8))       # warm up
+        log.info("plant encoder ready: %s on %s", model_id, device)
+
+    def embed(self, image: np.ndarray) -> np.ndarray:
+        inputs = self._proc(images=image, return_tensors="pt").to(self._device)
+        with self._torch.inference_mode():
+            cls = self._model(**inputs).last_hidden_state[:, 0]
+        v = cls[0].float().cpu().numpy()
+        return (v / max(float(np.linalg.norm(v)), 1e-8)).astype(np.float32)
+
+
 def build() -> Backend:
     device = _resolve_device(settings.device)
     return Backend(
@@ -181,4 +218,5 @@ def build() -> Backend:
         face=InsightFaceEncoder(settings.face_model, device),
         depth=DepthAnythingEstimator(settings.depth_model, device),
         kind="real",
+        plant=Dinov2PlantEncoder(settings.plant_model, device),
     )

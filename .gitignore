@@ -8,3 +8,9 @@ __pycache__/
 # The face gallery is personal data. Default location is ~/.robot-vision/, but
 # if you ever point VS_GALLERY_PATH at the repo, this keeps it out of git.
 *.npz
+# Local settings for run.sh / make (VS_PORT, VS_DEVICE, ...). Machine-specific.
+.env
+# Photos saved by the enroll endpoints (personal data).
+/plants/
+/faces/
+/maps/

@@ -31,8 +31,9 @@ class Match:
 
 
 class Gallery:
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, noun: str = "people") -> None:
         self._path = path
+        self._noun = noun                  # what stats() calls the distinct labels
         self._lock = threading.Lock()
         self._vectors: np.ndarray = np.zeros((0, EMBED_DIM_DEFAULT), dtype=np.float32)
         self._labels: list[str] = []
@@ -119,7 +120,7 @@ class Gallery:
         with self._lock:
             return {
                 "embeddings": len(self._labels),
-                "people": len(set(self._labels)),
+                self._noun: len(set(self._labels)),
             }
 
     def labels(self) -> list[str]:

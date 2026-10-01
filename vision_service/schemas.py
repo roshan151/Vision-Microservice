@@ -33,6 +33,7 @@ class EmbedResponse(BaseModel):
     embedding: list[float]
     face_bbox: list[float] = Field(min_length=4, max_length=4)
     quality: float
+    face_count: int = 1
     model_version: str
     inference_ms: float
 
@@ -77,6 +78,8 @@ class HealthResponse(BaseModel):
     backend: str
     versions: dict[str, str]
     gallery: dict[str, int]
+    plants: dict[str, int] = {}
+    vlm: list[str] = []
     queue_depth: int
     uptime_s: float
 

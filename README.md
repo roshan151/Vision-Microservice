@@ -4,24 +4,28 @@ The off-Pi half of the robot's perception layer. Runs on the Mac mini; the
 Raspberry Pi is the only client.
 
 Why it exists, and why each endpoint is shaped the way it is, lives in
-[`../docs/VISION-DESIGN.md`](../docs/VISION-DESIGN.md) Part 3. This file is the
-contract: what to call, what comes back, and what to do when it doesn't.
+`docs/VISION-DESIGN.md` Part 3 in the Robot-Computer-Vision repo (as do the
+`PLAN.md` rules referenced below). This file is the contract: what to call,
+what comes back, and what to do when it doesn't, plus how to deploy it.
 
 ---
 
 ## Quick start
 
+On the Mac mini, from the repo root (needs Python 3.10+, e.g. `brew install python`):
+
 ```bash
-cd vision_service
-python3 -m venv .venv && source .venv/bin/activate
-
-pip install -e '.[dev]'             # API + tests. No models, works anywhere.
-pip install -e '.[models,dev]'      # + the real models. macOS arm64.
-
-pytest                              # 36 tests, ~1s, no GPU needed
-VS_BACKEND=fake ./run.sh            # serve stubs
-./run.sh                            # serve for real (VS_BACKEND=real)
+make deploy        # create .venv, install everything, run the tests, start the service
+make status        # is it running and healthy?
 ```
+
+That's the whole setup. After that, **every time you change the code:**
+
+```bash
+make deploy
+```
+
+Details, and what each step does, in [Deploying](#deploying).
 
 Interactive docs at `http://<mini>:8080/docs` once it's up — FastAPI generates
 them from the same code that serves the requests, so they cannot drift.
@@ -188,6 +192,11 @@ curl -s -F label=roshan \
      http://mini.local:8080/v1/faces/enroll | jq
 ```
 
+The accepted photos are also saved to `faces/<label>/photo_{i}.png` with a
+`bbox_{i}.txt` (`x1 y1 x2 y2` of the face), by a background task after the
+response. `label` becomes a folder name, so it must match `[A-Za-z0-9_-]{1,64}`
+(`422` otherwise).
+
 Aim for 4–8 images per person across varied lighting and angle. More than that
 adds little; fewer makes the threshold delicate.
 
@@ -246,6 +255,26 @@ map — much smaller payload, and you only ever want a handful of values.
 
 ---
 
+### Explore mode: plants, `/v1/ask`, SLAM
+
+Used by the robot's explore mode (`Robot-RPi-Core/docs/EXPLORE-DESIGN.md`).
+Full request/response shapes: `http://<mac>:8080/docs`.
+
+| Endpoint | What it does |
+|---|---|
+| `POST /v1/plants/embed` | Plant crop → DINOv2 embedding |
+| `POST /v1/plants/match` | Embedding (+ map position) → best plants, each with similarity **and** distance from where it was last seen |
+| `POST /v1/plants/enroll` | Photos + meta → a new `plant_NNN`, or a new visit when `label` is an existing plant. Embeddings are stored before it answers; the photos are written by a background task to `plants/map_{index}/plant_{NNN}/photo_{i}.png` + `bbox_{i}.txt` (`x1 y1 x2 y2` of the potted plant, empty if none found). `map_{index}` is bumped by each new `POST /v1/slam/reset` |
+| `GET /v1/plants` · `GET /v1/plants/{label}` · `GET /v1/plants/{label}/{file}` · `DELETE /v1/plants/{label}` | Register admin; delete moves photos to `_deleted/` |
+| `POST /v1/ask` | Images + question → answer from Gemini, or a local VLM via Ollama. `json=true` also parses the answer |
+| `POST /v1/slam/keyframe` | Odometry pose + TF-Luna rays → corrected pose, `map_to_odom`, next unexplored goal and path |
+| `POST /v1/slam/plan` · `POST /v1/slam/viewpoints` | Path between two points; reachable poses around a plant |
+| `POST /v1/slam/reset` · `POST /v1/slam/save` · `GET /v1/slam/state` | Runs and saved maps (`reset` with `load: true` continues a saved map from a given start pose) |
+| `GET /v1/slam/map.png` | The map: free white, walls black, robot trail blue, plants red |
+
+SLAM and `/v1/ask` run in worker threads, never through the GPU runner, so a
+slow map update or a 10 s VLM answer never delays `/v1/detect`.
+
 ### `GET /healthz` · `GET /v1/models` — ops
 
 ```json
@@ -259,10 +288,9 @@ map — much smaller payload, and you only ever want a handful of values.
 }
 ```
 
-Two fields worth alerting on. **`backend: "fake"` in production means the robot
-is seeing invented furniture** — the service logs a loud warning at startup, but
-check it here too. **`queue_depth` climbing** means requests are arriving faster
-than the GPU retires them.
+The field worth alerting on is **`queue_depth` climbing**: requests are arriving
+faster than the GPU retires them. `backend` is always `"real"` in the running
+service.
 
 ---
 
@@ -295,13 +323,15 @@ the two halves are designed to agree.
 
 ## Configuration
 
-All environment variables. Defaults match VISION-DESIGN.md's appendix.
+All environment variables. Defaults match VISION-DESIGN.md's appendix. To change
+any of them, put `KEY=value` lines in a `.env` file at the repo root (start from
+`.env.example`; plain values, no quotes), then `make restart`. `.env` is
+gitignored, and both `run.sh` and the Makefile read it.
 
 | Variable | Default | Notes |
 |---|---|---|
 | `VS_HOST` / `VS_PORT` | `0.0.0.0` / `8080` | |
-| `VS_BACKEND` | `auto` | `real` \| `fake` \| `auto`. **Set `real` in production** |
-| `VS_DEVICE` | `mps` | Falls back to `cpu` with a warning if unavailable |
+| `VS_DEVICE` | `mps` | `mps` \| `cuda` \| `cpu`. Falls back to `cpu` with a warning if unavailable |
 | `VS_DETECT_MODEL` | `yolov8n.pt` | Downloaded on first run |
 | `VS_DETECT_IMGSZ` | `640` | Match what the Pi sends |
 | `VS_FACE_MODEL` | `buffalo_l` | InsightFace pack |
@@ -312,54 +342,128 @@ All environment variables. Defaults match VISION-DESIGN.md's appendix.
 | `VS_MAX_ENROLL_IMAGES` | `16` | Per enroll call |
 | `VS_MAX_QUEUE_DEPTH` | `4` | Above this, refuse with `503` |
 | `VS_INFERENCE_TIMEOUT_S` | `10.0` | Server-side; the Pi's own is 0.6 s |
+| `VS_PLANT_MODEL` | `facebook/dinov2-small` | Plant identity embedding (downloaded on first start) |
+| `VS_PLANT_DIR` | `./plants` (next to the code) | Plant register: embeddings + `map_{index}/plant_{NNN}/` photo folders |
+| `VS_FACE_PHOTO_DIR` | `./faces` (next to the code) | Enrolled face photos: `<name>/photo_{i}.png` + `bbox_{i}.txt` |
+| `VS_PLANT_MATCH_THRESHOLD` | `0.62` | Tune after a few real plants |
+| `VS_VLM_PROVIDERS` | `gemini,ollama` | Tried in order by `/v1/ask` |
+| `GEMINI_API_KEY` | — | Enables the `gemini` provider |
+| `VS_GEMINI_MODEL` | `gemini-3.6-flash` | |
+| `VS_OLLAMA_URL` / `VS_OLLAMA_MODEL` | `http://127.0.0.1:11434` / `qwen3-vl:8b` | Local, 4-bit: `ollama pull qwen3-vl:8b` |
+| `VS_VLM_TIMEOUT_S` | `45` | |
+| `VS_SLAM_DIR` | `./maps` (next to the code) | Saved maps: `<name>.npz` (reloadable) + `<name>.png`, rewritten after every keyframe |
+| `VS_SLAM_SIZE_M` / `VS_SLAM_RES_M` | `24` / `0.05` | Map extent and cell size |
+| `VS_ROBOT_RADIUS_M` | `0.18` | Paths keep this far (+5 cm) from walls |
 
-`VS_BACKEND=auto` prefers real models and degrades to fake with a warning, so a
-fresh clone runs. Production sets `real` so a missing dependency is a startup
-failure rather than a robot that confidently sees furniture that isn't there.
+The service always loads the real models. A missing dependency or a model that
+won't load is a startup failure (visible in `make logs`), never a silent
+degradation.
 
 ---
 
-## Running it permanently
+## Deploying
 
-`deploy/com.roshan.visionservice.plist` is a launchd agent with `KeepAlive`, a
-restart throttle, and `caffeinate` in `run.sh`.
+The service runs in the background as a **launchd agent**, macOS's built-in
+service manager (think of it as `docker run --restart unless-stopped` without the
+container). There is no build step: the code is installed into `.venv` in
+editable mode, so the running service uses the files in this folder directly.
+"Deploying" a change just means reinstalling dependencies if they changed,
+running the tests, and restarting.
+
+### After every change
 
 ```bash
-cp deploy/com.roshan.visionservice.plist ~/Library/LaunchAgents/
-# edit the two absolute paths inside first
-launchctl load -w ~/Library/LaunchAgents/com.roshan.visionservice.plist
-
-launchctl list | grep visionservice
-tail -f /tmp/vision-service.log
-launchctl kickstart -k gui/$(id -u)/com.roshan.visionservice     # restart
+make deploy
 ```
 
-**`caffeinate -i` is not decoration.** A sleeping mini looks exactly like bad
-wifi from the Pi's side, and that is a miserable thing to debug. A LaunchAgent
-(not a LaunchDaemon) is correct here: it runs in your GUI session, which is what
-lets it reach the GPU.
+That runs, in order, stopping at the first failure:
+
+1. **`make install`**: creates `.venv` and installs `.[models,dev]`. Only does
+   work when `pyproject.toml` has changed since the last install, so it's
+   instant most of the time.
+2. **`make test`**: the test suite. A failing test stops the deploy, and the
+   old version keeps running.
+3. **`make start`**: stops the running service, starts the new code, then
+   waits for `/healthz` to answer (up to 180 s, since the first start
+   downloads model weights) and prints it. If it never comes up, it prints
+   the end of the log instead.
+
+### Everyday commands
+
+| Command | What it does |
+|---|---|
+| `make deploy` | Install if needed → test → restart → wait until healthy |
+| `make start` / `make restart` | Restart without reinstalling or testing |
+| `make stop` | Stop it. Stays stopped until `make start` or your next login |
+| `make status` | launchd state (running? pid? crash count?) + `/healthz` |
+| `make logs` | Follow the log. `Ctrl-C` to stop following |
+| `make run` | Run in this terminal instead (for debugging; `make stop` first) |
+| `make test` | Just the tests |
+| `make reinstall` | Delete `.venv` and install from scratch |
+| `make uninstall` | Stop it and remove it from launchd entirely |
+| `make help` | List all of the above |
+
+### What's where
+
+| Thing | Location |
+|---|---|
+| Python environment | `.venv/` in this folder |
+| Your settings | `.env` in this folder (optional, see [Configuration](#configuration)) |
+| launchd job | `~/Library/LaunchAgents/com.roshan.visionservice.plist`, generated from `deploy/com.roshan.visionservice.plist.in` by `make start`, so its paths always point at this checkout |
+| Log | `~/Library/Logs/vision-service/vision-service.log`. The previous run's log is kept as `.log.1` |
+| Face gallery | `~/.robot-vision/gallery.npz` (`VS_GALLERY_PATH`) |
+| Model weights | Downloaded on first start: YOLO into this folder (gitignored), InsightFace into `~/.insightface`, Depth Anything into `~/.cache/huggingface` |
+
+### How it stays up
+
+- **Starts at login** and **restarts on crash** (launchd `KeepAlive`, at most
+  once every 10 s so a crash loop can't spin the CPU). `make status` shows
+  `runs` and `last exit code` if it has been restarting.
+- **Keeps the Mac awake** while it runs: `run.sh` starts `caffeinate` tied to
+  the server's process, so it ends when the server does. A sleeping mini looks
+  exactly like bad wifi from the Pi's side, and that is a miserable thing to
+  debug. Set the mini to log in automatically after a power cut, or the service
+  won't start until someone logs in.
+- A LaunchAgent (not a LaunchDaemon) is deliberate: it runs as you, in your
+  login session, which is what lets it reach the GPU.
+
+### When something's wrong
+
+| Symptom | Look at |
+|---|---|
+| `make deploy` stops at tests | The failing test's output. Nothing was restarted |
+| "not healthy after 180s" | The log lines it printed. Usually a model failing to load or a missing package; `make reinstall` fixes the latter |
+| "Port 8080 is already in use by: ..." | Something else is listening on 8080 — `make start` refuses to start and prints what it is. Usually a `./run.sh`/`make run` left open in another terminal, or an old copy of the service. `kill <PID>` it, or set `VS_PORT` in `.env` (and on the Pi) |
+| `make status` shows `runs` climbing | It's crash-looping. `make logs` |
+| Pi gets timeouts, service looks fine | `make health`: check `queue_depth` and `versions.detect` ends in `-mps`, not `-cpu` |
 
 ---
 
 ## Architecture
 
 ```
-app.py          routes, validation, error shapes — the only file that knows HTTP
-runner.py       one worker thread + bounded waiting. Serializes GPU access
-gallery.py      labelled embeddings on disk, cosine match in numpy
-images.py       bytes -> RGB ndarray, with the size limit enforced early
-schemas.py      response models. This IS the contract
-backends/
-  base.py       the Protocol every backend satisfies
-  real.py       Ultralytics YOLO, InsightFace, Depth Anything V2
-  fake.py       deterministic stubs. No models, no GPU, no network
+Makefile            install / test / deploy / start / stop / logs. `make help`
+run.sh              what launchd runs: loads .env, keeps the Mac awake, starts uvicorn
+deploy/             launchd job template (rendered by `make start`)
+vision_service/
+  app.py            routes, validation, error shapes — the only file that knows HTTP
+  runner.py         one worker thread + bounded waiting. Serializes GPU access
+  gallery.py        labelled embeddings on disk, cosine match in numpy
+  images.py         bytes -> RGB ndarray, with the size limit enforced early
+  schemas.py        response models. This IS the contract
+  settings.py       every VS_* environment variable and its default
+  backends/
+    base.py         the Protocol every backend satisfies
+    real.py         Ultralytics YOLO, InsightFace, Depth Anything V2
+tests/
+  stub_backend.py   test-only stand-in for real.py. No models, no GPU
 ```
 
-**The backend seam is the reason the test suite runs anywhere.** `FakeBackend`
-satisfies the same protocol as the real one, so every route, validation path and
-error branch is covered on a laptop in under a second — and you can develop the
-Pi client on a train. Fake outputs are derived from image content, so they're
-stable across runs but differ between images, which is what a test needs.
+**The backend seam is the reason the test suite runs anywhere.** The tests swap
+in `tests/stub_backend.py`, which satisfies the same protocols as `real.py`, so
+every route, validation path and error branch is covered in about a second with
+no models installed. That stub exists only inside the tests; the service itself
+has no way to select it.
 
 Two deliberate choices worth knowing:
 

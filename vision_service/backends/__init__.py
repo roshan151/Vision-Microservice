@@ -1,28 +1,24 @@
-"""Backend selection.
+"""Backend construction.
 
-`VS_BACKEND` decides: "real" insists on models, "fake" insists on stubs, and
-"auto" prefers real but degrades to fake with a loud warning. Auto is the
-default so a fresh clone runs; production sets "real" so a missing dependency
-is a startup failure rather than a robot that silently sees imaginary furniture.
+The service always loads the real models (`real.py`). A missing dependency or
+unloadable model is a startup failure, never a silent degradation.
 """
 
 from __future__ import annotations
 
-import logging
-
-from ..settings import settings
-from .base import Backend, Detection, DepthEstimator, Detector, FaceEmbedding, FaceEncoder
-
-log = logging.getLogger(__name__)
+from .base import (
+    Backend, Detection, DepthEstimator, Detector, FaceEmbedding, FaceEncoder, PlantEncoder,
+)
 
 __all__ = [
     "Backend", "Detection", "FaceEmbedding",
-    "Detector", "FaceEncoder", "DepthEstimator",
+    "Detector", "FaceEncoder", "DepthEstimator", "PlantEncoder",
     "build_backend",
 ]
 
 
 def build_backend() -> Backend:
-
+    # Imported here so that importing the app (e.g. in tests) never pulls in
+    # torch and friends.
     from . import real
     return real.build()

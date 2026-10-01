@@ -1,4 +1,5 @@
-"""The HTTP surface. One client (the Pi), five inference endpoints, two for ops.
+"""The HTTP surface. One client (the Pi), five inference endpoints, two for ops;
+explore mode's plant, ask and SLAM endpoints live in explore_api.py.
 
 Transport rules that every endpoint obeys, from VISION-DESIGN.md Part 3:
   * binary JPEG via multipart/form-data. Never base64 — it costs 33% for nothing
@@ -14,18 +15,22 @@ import time
 from contextlib import asynccontextmanager
 
 import numpy as np
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse
 
-from . import images
+from . import images, photos
 from .backends import build_backend
+from .explore_api import router as explore_router
 from .gallery import Gallery
+from .plants import BadLabel, PlantStore, check_label
 from .runner import Busy, InferenceRunner, InferenceTimeout
 from .schemas import (
     DepthResponse, DetectResponse, DetectionOut, EmbedResponse, EnrollResponse,
     HealthResponse, MatchOut, MatchResponse, ModelsResponse,
 )
 from .settings import settings
+from .slam import SlamConfig, SlamSession
+from .vlm import VLM
 
 log = logging.getLogger("vision_service")
 
@@ -33,18 +38,20 @@ log = logging.getLogger("vision_service")
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     t0 = time.monotonic()
-    log.info("loading backend (VS_BACKEND=%s)...", settings.backend)
+    log.info("loading models on VS_DEVICE=%s...", settings.device)
     app.state.backend = build_backend()
     app.state.gallery = Gallery(settings.gallery_path)
     app.state.runner = InferenceRunner(settings.max_queue_depth, settings.inference_timeout_s)
+    app.state.plants = PlantStore(settings.plant_dir)
+    app.state.vlm = VLM(settings)
+    app.state.slam = SlamSession(SlamConfig(
+        size_m=settings.slam_size_m, res=settings.slam_res_m, robot_radius=settings.robot_radius_m))
     app.state.started_at = time.monotonic()
     log.info(
         "ready in %.1fs — backend=%s versions=%s gallery=%s",
         time.monotonic() - t0, app.state.backend.kind,
         app.state.backend.versions(), app.state.gallery.stats(),
     )
-    if app.state.backend.kind == "fake":
-        log.warning("SERVING FAKE DETECTIONS — this backend invents objects. Set VS_BACKEND=real.")
     try:
         yield
     finally:
@@ -54,9 +61,10 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Robot Vision Service",
     version="1.0.0",
-    description="Off-Pi perception for Robot-Computer-Vision. See vision_service/README.md.",
+    description="Off-Pi perception for Robot-Computer-Vision. See README.md.",
     lifespan=lifespan,
 )
+app.include_router(explore_router)
 
 
 # --------------------------------------------------------------------------
@@ -105,6 +113,8 @@ async def healthz(request: Request) -> HealthResponse:
         backend=st.backend.kind,
         versions=st.backend.versions(),
         gallery=st.gallery.stats(),
+        plants=st.plants.gallery.stats(),
+        vlm=st.vlm.available(),
         queue_depth=st.runner.queue_depth,
         uptime_s=round(time.monotonic() - st.started_at, 1),
     )
@@ -178,6 +188,7 @@ async def embed(
         embedding=[round(float(v), 6) for v in result.embedding.tolist()],
         face_bbox=list(result.face_bbox),
         quality=result.quality,
+        face_count=result.face_count,
         model_version=st.backend.face.model_version,
         inference_ms=ms,
     )
@@ -212,35 +223,47 @@ async def match(request: Request, body: dict) -> MatchResponse:
 @app.post("/v1/faces/enroll", response_model=EnrollResponse, tags=["admin"])
 async def enroll(
     request: Request,
+    background: BackgroundTasks,
     label: str = Form(..., min_length=1, max_length=64),
     images_: list[UploadFile] = File(..., alias="images"),
 ) -> EnrollResponse:
     """Add a person to the gallery. Admin/offline — never on the hot path.
 
-    Images with no detectable face are counted in `images_rejected` rather than
+    The accepted photos are saved as faces/<label>/photo_i.png + bbox_i.txt by a
+    background task; the response does not wait for them.
+
+    Images with no face, or more than one (whose face would be ambiguous), are
+    counted in `images_rejected` rather than
     failing the call, so one bad photo in a batch of ten does not lose the other
     nine. A call where every image is rejected is a 422.
     """
     st = request.app.state
+    try:
+        check_label(label)              # it becomes a folder name
+    except BadLabel as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     if len(images_) > settings.max_enroll_images:
         raise HTTPException(
             status_code=413,
             detail=f"{len(images_)} images exceeds the {settings.max_enroll_images} limit",
         )
-    embeddings, rejected = [], 0
+    embeddings, shots, rejected = [], [], 0
     for upload in images_:
         frame = images.decode(await upload.read())
         result, _ = await st.runner.run(st.backend.face.embed, frame)
-        if result is None:
+        if result is None or result.face_count > 1:
             rejected += 1
             continue
         embeddings.append(result.embedding)
+        shots.append((frame, result.face_bbox))
     if not embeddings:
-        raise HTTPException(status_code=422, detail="no face found in any supplied image")
+        raise HTTPException(status_code=422, detail="no single-face image among those supplied")
     try:
         added = st.gallery.add(label, embeddings)
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    folder = settings.face_photo_dir / label
+    background.add_task(photos.write_all, folder, photos.next_index(folder), shots)
     log.info("enrolled %s: +%d embeddings (%d rejected)", label, added, rejected)
     return EnrollResponse(
         label=label, embeddings_added=added,

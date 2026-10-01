@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd job for the robot vision service. TEMPLATE — don't copy it by hand.
+
+  `make start` fills in __REPO_DIR__ and __LOG_FILE__ and installs the result at
+  ~/Library/LaunchAgents/com.roshan.visionservice.plist, so the paths always
+  match wherever this repo is checked out.
+
+  A LaunchAgent (not a LaunchDaemon) is right here: it runs as you, in your GUI
+  session, which is what lets it see your Python environment and use the GPU.
+
+  Settings (port, device, models...) go in .env at the repo root, not here.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.roshan.visionservice</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__REPO_DIR__/run.sh</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__REPO_DIR__</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <!-- Homebrew and friends are not on launchd's default PATH. -->
+        <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <dict>
+        <!-- Restart if it exits for any reason except a clean stop. -->
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <!-- Back off between restarts so a crash loop does not spin the CPU. -->
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <!-- One file for both streams: uvicorn logs to stderr, print() to stdout. -->
+    <key>StandardOutPath</key>
+    <string>__LOG_FILE__</string>
+    <key>StandardErrorPath</key>
+    <string>__LOG_FILE__</string>
+
+    <!-- Models are memory-hungry; do not let launchd throttle this to a crawl. -->
+    <key>ProcessType</key>
+    <string>Interactive</string>
+</dict>
+</plist>
