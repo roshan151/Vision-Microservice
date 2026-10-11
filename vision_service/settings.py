@@ -47,7 +47,15 @@ class Settings:
     gallery_path: Path = field(
         default_factory=lambda: Path(_env("VS_GALLERY_PATH", "~/.robot-vision/gallery.npz")).expanduser()
     )
-    match_threshold: float = field(default_factory=lambda: _env_f("VS_MATCH_THRESHOLD", 0.75))
+    # buffalo_l (ArcFace) cosine. Same person across lighting/pose scores ~0.4-0.7, so
+    # 0.75 only ever matched near-duplicates of the enrolment frames. Follow also needs
+    # CONFIRM_FRAMES agreeing frames, which is what makes a lower cut-off safe.
+    match_threshold: float = field(default_factory=lambda: _env_f("VS_MATCH_THRESHOLD", 0.45))
+    # A clear face scoring below this against the follow target is someone else:
+    # follow mode will not track that person by their clothes.
+    face_reject_threshold: float = field(default_factory=lambda: _env_f("VS_FACE_REJECT_THRESHOLD", 0.25))
+    # Face detector input size. 640 keeps small faces findable in 1080p frames.
+    face_det_size: int = field(default_factory=lambda: _env_i("VS_FACE_DET_SIZE", 640))
     # Same cut-off the Pi uses (FACE_MIN_QUALITY): /v1/faces/embed keeps frames below it
     # in faces/_rejected/ so a failed enroll can be inspected afterwards.
     face_min_quality: float = field(default_factory=lambda: _env_f("VS_FACE_MIN_QUALITY", 0.6))

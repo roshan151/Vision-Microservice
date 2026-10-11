@@ -38,7 +38,7 @@ def test_enroll_then_match_round_trip(client):
     body = client.post("/v1/faces/match", json={"embedding": emb, "top_k": 1}).json()
     assert body["matches"][0]["label"] == "roshan"
     assert body["matches"][0]["similarity"] > 0.99
-    assert body["threshold"] == 0.75
+    assert body["threshold"] == 0.45
 
 
 def test_a_stranger_scores_below_threshold(client):

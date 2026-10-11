@@ -96,7 +96,8 @@ class InsightFaceEncoder:
             if device == "mps" else ["CPUExecutionProvider"]
         )
         self._app = FaceAnalysis(name=pack, providers=providers)
-        self._app.prepare(ctx_id=0, det_size=(320, 320))
+        size = settings.face_det_size
+        self._app.prepare(ctx_id=0, det_size=(size, size))
         self.model_version = f"insightface-{pack}"
         log.info("face encoder ready: %s via %s", pack, providers[0])
 
@@ -125,14 +126,18 @@ def _face_quality(face, image: np.ndarray, bbox: tuple[float, ...]) -> float:
     variance cover the rest. Not calibrated — it only has to rank.
     """
     x1, y1, x2, y2 = bbox
-    h, w = image.shape[:2]
-    area_frac = max(0.0, ((x2 - x1) * (y2 - y1)) / float(w * h))
-    size_score = min(1.0, area_frac / 0.08)          # ~8% of frame is plenty
+    # Size in pixels, not as a share of the frame: the encoder sees a 112 px crop,
+    # so a face that size is plenty whether the frame is 640 or 1920 wide.
+    size_score = min(1.0, max(0.0, min(x2 - x1, y2 - y1)) / 112.0)
 
     crop = image[max(0, int(y1)):int(y2), max(0, int(x1)):int(x2)]
     if crop.size == 0:
         return 0.0
     grey = crop.mean(axis=2) if crop.ndim == 3 else crop
+    if min(grey.shape) > 112:                        # judge sharpness at encoder scale
+        from PIL import Image
+        grey = np.asarray(Image.fromarray(grey.astype(np.uint8)).resize((112, 112), Image.BILINEAR),
+                          dtype=np.float32)
     # Laplacian variance without a cv2 round trip.
     lap = (
         -4 * grey[1:-1, 1:-1]
