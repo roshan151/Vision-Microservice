@@ -14,3 +14,4 @@ __pycache__/
 /plants/
 /faces/
 /maps/
+.DS_Store

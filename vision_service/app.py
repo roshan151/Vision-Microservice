@@ -1,5 +1,6 @@
 """The HTTP surface. One client (the Pi), five inference endpoints, two for ops;
-explore mode's plant, ask and SLAM endpoints live in explore_api.py.
+explore mode's plant, ask and SLAM endpoints live in explore_api.py, follow mode's
+in follow.py.
 
 Transport rules that every endpoint obeys, from VISION-DESIGN.md Part 3:
   * binary JPEG via multipart/form-data. Never base64 — it costs 33% for nothing
@@ -21,6 +22,7 @@ from fastapi.responses import JSONResponse
 from . import images, photos
 from .backends import build_backend
 from .explore_api import router as explore_router
+from .follow import FollowSession, router as follow_router
 from .gallery import Gallery
 from .plants import BadLabel, PlantStore, check_label
 from .runner import Busy, InferenceRunner, InferenceTimeout
@@ -46,6 +48,7 @@ async def lifespan(app: FastAPI):
     app.state.vlm = VLM(settings)
     app.state.slam = SlamSession(SlamConfig(
         size_m=settings.slam_size_m, res=settings.slam_res_m, robot_radius=settings.robot_radius_m))
+    app.state.follow = FollowSession()
     app.state.started_at = time.monotonic()
     log.info(
         "ready in %.1fs — backend=%s versions=%s gallery=%s",
@@ -65,6 +68,7 @@ app = FastAPI(
     lifespan=lifespan,
 )
 app.include_router(explore_router)
+app.include_router(follow_router)
 
 
 # --------------------------------------------------------------------------
@@ -166,6 +170,7 @@ async def detect(
 @app.post("/v1/faces/embed", response_model=EmbedResponse, tags=["inference"])
 async def embed(
     request: Request,
+    background: BackgroundTasks,
     image: UploadFile = File(..., description="JPEG crop of the person/head region"),
     seq: int = Form(...),
 ) -> EmbedResponse:
@@ -183,6 +188,8 @@ async def embed(
     result, ms = await st.runner.run(st.backend.face.embed, crop)
     if result is None:
         raise HTTPException(status_code=404, detail="no face found in crop")
+    if result.quality < settings.face_min_quality or result.face_count > 1:
+        background.add_task(_save_rejected, crop, result, seq)
     return EmbedResponse(
         seq=seq,
         embedding=[round(float(v), 6) for v in result.embedding.tolist()],
@@ -192,6 +199,26 @@ async def embed(
         model_version=st.backend.face.model_version,
         inference_ms=ms,
     )
+
+
+def _save_rejected(rgb: np.ndarray, result, seq: int) -> None:
+    """Background task: keep a face frame the Pi will drop (quality below the cut-off,
+    or several faces) as faces/_rejected/photo_<epoch ms>.png + bbox, and append its
+    quality to quality.csv. The Pi never sends these to /enroll, so without this a
+    failed enroll leaves nothing behind to look at."""
+    folder = settings.face_photo_dir / "_rejected"
+    i = int(time.time() * 1000)
+    try:
+        photos.write(folder, i, rgb, result.face_bbox)
+        csv = folder / "quality.csv"
+        new = not csv.exists()
+        with csv.open("a") as f:
+            if new:
+                f.write("photo,time,seq,quality,face_count\n")
+            f.write(f"photo_{i}.png,{time.strftime('%Y-%m-%d %H:%M:%S')},{seq},"
+                    f"{result.quality:.3f},{result.face_count}\n")
+    except Exception:                                       # noqa: BLE001
+        log.exception("could not save rejected face photo_%d", i)
 
 
 @app.post("/v1/faces/match", response_model=MatchResponse, tags=["inference"])

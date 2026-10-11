@@ -123,3 +123,21 @@ def test_face_label_cannot_escape_the_folder(client):
     r = client.post("/v1/faces/enroll", data={"label": "../x"},
                     files=[("images", ("a.jpg", jpeg(200, 200), "image/jpeg"))])
     assert r.status_code == 422
+
+
+def test_low_quality_embed_is_kept_for_inspection(client, monkeypatch):
+    from vision_service import settings as settings_mod
+    monkeypatch.setattr(settings_mod.settings, "face_min_quality", 0.95)   # stub quality is 0.9
+    _embed(client, jpeg(160, 160, (200, 180, 170)), seq=7)
+    folder = settings_mod.settings.face_photo_dir / "_rejected"
+    rows = (folder / "quality.csv").read_text().splitlines()
+    assert rows[0] == "photo,time,seq,quality,face_count"
+    photo, _, seq, quality, count = rows[1].split(",")
+    assert (seq, quality, count) == ("7", "0.900", "1")
+    assert (folder / photo).exists()
+
+
+def test_good_embed_is_not_kept(client):
+    from vision_service import settings as settings_mod
+    _embed(client, jpeg(160, 160, (200, 180, 170)))
+    assert not (settings_mod.settings.face_photo_dir / "_rejected").exists()

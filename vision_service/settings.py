@@ -48,6 +48,9 @@ class Settings:
         default_factory=lambda: Path(_env("VS_GALLERY_PATH", "~/.robot-vision/gallery.npz")).expanduser()
     )
     match_threshold: float = field(default_factory=lambda: _env_f("VS_MATCH_THRESHOLD", 0.75))
+    # Same cut-off the Pi uses (FACE_MIN_QUALITY): /v1/faces/embed keeps frames below it
+    # in faces/_rejected/ so a failed enroll can be inspected afterwards.
+    face_min_quality: float = field(default_factory=lambda: _env_f("VS_FACE_MIN_QUALITY", 0.6))
 
     # --- plants ----------------------------------------------------------
     # DINOv2 is trained for instance-level visual similarity, which is exactly
