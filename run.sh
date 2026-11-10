@@ -33,4 +33,5 @@ exec .venv/bin/python -m uvicorn vision_service.app:app \
     --host "$VS_HOST" --port "$VS_PORT" \
     --workers 1 \
     --timeout-keep-alive 75 \
+    --no-access-log \
     --log-level info

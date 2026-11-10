@@ -25,6 +25,7 @@ from .explore_api import router as explore_router
 from .follow import FollowSession, router as follow_router
 from .gallery import Gallery
 from .plants import BadLabel, PlantStore, check_label
+from .reqlog import RequestLog, setup as setup_logging
 from .runner import Busy, InferenceRunner, InferenceTimeout
 from .schemas import (
     DepthResponse, DetectResponse, DetectionOut, EmbedResponse, EnrollResponse,
@@ -69,6 +70,8 @@ app = FastAPI(
 )
 app.include_router(explore_router)
 app.include_router(follow_router)
+setup_logging()
+app.add_middleware(RequestLog)      # one timestamped in/out line per request (reqlog.py)
 
 
 # --------------------------------------------------------------------------
