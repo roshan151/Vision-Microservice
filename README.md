@@ -410,7 +410,7 @@ That runs, in order, stopping at the first failure:
 | Python environment | `.venv/` in this folder |
 | Your settings | `.env` in this folder (optional, see [Configuration](#configuration)) |
 | launchd job | `~/Library/LaunchAgents/com.roshan.visionservice.plist`, generated from `deploy/com.roshan.visionservice.plist.in` by `make start`, so its paths always point at this checkout |
-| Log | `~/Library/Logs/vision-service/vision-service.log`. The previous run's log is kept as `.log.1` |
+| Log | `~/Library/Logs/vision-service/vision-service.log`. The previous run's log is kept as `.log.1`. One timestamped line per request: client, endpoint, status, time taken, the inputs (uploaded images as name, bytes and pixel size; form fields) and the answer (embeddings shortened to `<512 numbers>`); see `vision_service/reqlog.py` |
 | Face gallery | `~/.robot-vision/gallery.npz` (`VS_GALLERY_PATH`) |
 | Model weights | Downloaded on first start: YOLO into this folder (gitignored), InsightFace into `~/.insightface`, Depth Anything into `~/.cache/huggingface` |
 
