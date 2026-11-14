@@ -107,7 +107,8 @@ class InsightFaceEncoder:
             return None
         # Largest face wins. The Pi sends a crop it already believes is one
         # person, so this is a tiebreak, not a selection policy.
-        face = max(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
+        faces = sorted(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]), reverse=True)
+        face = faces[0]
         v = np.asarray(face.normed_embedding, dtype=np.float32)
         x1, y1, x2, y2 = (float(c) for c in face.bbox)
         return FaceEmbedding(
@@ -115,6 +116,7 @@ class InsightFaceEncoder:
             face_bbox=(x1, y1, x2, y2),
             quality=_face_quality(face, image, (x1, y1, x2, y2)),
             face_count=len(faces),
+            face_bboxes=tuple(tuple(float(c) for c in f.bbox) for f in faces),
         )
 
 
