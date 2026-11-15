@@ -26,9 +26,8 @@ does what the answer says. One follower at a time, like the SLAM session.
             (the image centre column) lands on the box, otherwise from the box's
             bottom edge on the floor plane when the feet are in view, otherwise
             from the size of their face, otherwise from the width of their box
-            (an average adult's); with the feet out of frame it is never taken as
-            further than where the floor comes into view, and is not driven on
-            then. Turn part of the way to face them (turn_gain:
+            (an average adult's); a box cut off at both the top and the bottom of
+            the frame is "near" and is not driven on. Turn part of the way to face them (turn_gain:
             an error in the angle then shrinks instead of swinging the robot back
             and forth), then close to the standoff in steps of at most
             max_step_m. Never reverses.
@@ -310,23 +309,22 @@ class FollowSession:
             return r * math.cos(math.radians(geo.tilt_deg)), "range"
         # A box ending at (or a few px short of) the bottom edge is cut off there: the
         # "feet" would be the frame edge, always the same distance whoever stands where.
-        near = None
+        near = False
         if box[3] < H * (1.0 - cfg.bottom_margin):
             below = math.radians(-geo.tilt_deg) + math.atan2(box[3] - H / 2.0, f)
             if below > math.radians(1.0):
                 return geo.camera_height_m / math.tan(below), "floor"
-        else:                                          # feet cut off: nearer than where the floor comes into view
-            edge = math.radians(-geo.tilt_deg) + math.atan2(H / 2.0, f)
-            near = geo.camera_height_m / math.tan(edge) if edge > math.radians(1.0) else None
+        else:                                          # cut off at the top as well: they fill the frame
+            near = box[1] <= H * cfg.bottom_margin
         if face_px:
             dist, how = f * cfg.face_width_m / face_px, "face"
         elif box[0] > 1.0 and box[2] < W - 1.0:        # their whole width is in view
             dist, how = f * cfg.body_width_m / max(box[2] - box[0], 1.0), "width"
         else:
             return None, None
-        # Legs alone are narrower than a body, so the guess reads too far and the robot crept in:
-        # with the feet out of frame it is at most `near`, and that is not driven on.
-        return (near, "near") if near is not None and dist > near else (dist, how)
+        # Filling the frame top to bottom they are close, whatever the size guess says (legs
+        # alone are narrower than a body and read as far): "near" is not driven on.
+        return dist, ("near" if near else how)
 
     def _out(self, state: str, geo: Geometry, box=None, bearing=None, dist=None, how=None,
              turn_deg: float = 0.0, drive_m: float = 0.0) -> dict:
@@ -338,7 +336,7 @@ class FollowSession:
             "bbox": [round(float(v), 1) for v in box] if box is not None else None,
             "bearing_deg": None if bearing is None else round(bearing, 1),
             "distance_m": None if dist is None else round(dist, 2),
-            "distance_from": how,                 # range | floor | face | width | near (feet cut off: at most this)
+            "distance_from": how,                 # range | floor | face | width | near (they fill the frame: no drive)
             "turn_deg": round(float(turn_deg), 1),
             "drive_m": round(float(drive_m), 2),
             "head": list(SEARCH_SWEEP[self.sweep - 1]) if self.sweep else [0, 0],
