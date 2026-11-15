@@ -24,14 +24,22 @@ does what the answer says. One follower at a time, like the SLAM session.
                 and is always learned.
     plan    bearing from the box centre; distance from the TF-Luna when its beam
             (the image centre column) lands on the box, otherwise from the box's
-            bottom edge on the floor plane. Turn to face them, then close to the
-            standoff in steps of at most MAX_STEP_M. Never reverses.
+            bottom edge on the floor plane when the feet are in view, otherwise
+            from the size of their face, otherwise from the width of their box
+            (an average adult's); with the feet out of frame it is never taken as
+            further than where the floor comes into view, and is not driven on
+            then. Turn part of the way to face them (turn_gain:
+            an error in the angle then shrinks instead of swinging the robot back
+            and forth), then close to the standoff in steps of at most
+            max_step_m. Never reverses.
     lose    a few frames without them: hold. Longer: sweep the HEAD (the robot
             stays put) through SEARCH_SWEEP - pan left to 90 in 30-degree steps,
             tilt up 45, pan right across to -90, tilt back down, pan back to
             centre; after the whole sweep the person is "gone" and the Pi ends
             the task. While anyone is in view the sweep pauses, so the head
-            stays on them until the face is checked. `head` in every answer is where the head should look:
+            stays on them until the face is checked. The only person in view,
+            in clothes like the target's and without someone else's face, is
+            taken back. `head` in every answer is where the head should look:
             (pan_deg, tilt_up_deg above the follow tilt); (0, 0) once tracking.
 
 Angles: bearing_deg follows the head (REP-103, + is LEFT); turn_deg follows the
@@ -57,10 +65,14 @@ from .settings import settings
 
 @dataclass
 class FollowConfig:
-    standoff_m: float = 1.2          # VISION-DESIGN 7.2 FOLLOW_STANDOFF_M
+    standoff_m: float = 0.8          # stop this far from them (VISION-DESIGN 7.2 FOLLOW_STANDOFF_M)
     max_step_m: float = 0.5          # longest drive per step; then look again
     drive_max_bearing_deg: float = 25.0   # turning further than this: turn only, look again
     turn_deadband_deg: float = 8.0
+    turn_gain: float = 0.6           # turn this share of the bearing each step, never all of it
+    bottom_margin: float = 0.03      # a box this close to the bottom edge has its feet out of frame
+    face_width_m: float = 0.16       # an adult's face box, for distance when the feet are not in view
+    body_width_m: float = 0.45       # an adult's person box, the last resort
     confirm_frames: int = 2
     min_similarity: float = 0.5      # histogram intersection, 0..1, near where they should be
     continuity_similarity: float = 0.35   # alone where they should be: enough to keep them
@@ -181,10 +193,12 @@ class FollowSession:
     # ------------------------------------------------------------------ step
 
     def step(self, rgb: np.ndarray, persons: Sequence[Detection],
-             face_labels: Sequence[Optional[str]], geo: Geometry) -> dict:
+             face_labels: Sequence[Optional[str]], geo: Geometry,
+             face_px: Sequence[Optional[float]] = ()) -> dict:
         """One frame. `face_labels[i]` is the gallery label (above threshold)
         of person i's face, STRANGER for a clear face that is not the target, or
-        None (no face, too unclear to say, or not checked)."""
+        None (no face, too unclear to say, or not checked). `face_px[i]` is the
+        width of person i's face in pixels, when one was seen."""
         cfg = self.cfg
         H, W = rgb.shape[:2]
         f = (W / 2.0) / math.tan(math.radians(geo.hfov_deg) / 2.0)
@@ -213,16 +227,16 @@ class FollowSession:
         box = persons[pick].bbox
         bearing = bearings[pick]
         self.last_bearing = bearing
-        dist = self._distance(box, W, H, f, geo)
+        dist, how = self._distance(box, W, H, f, geo, face_px[pick] if pick < len(face_px) else None)
 
-        turn = -bearing if abs(bearing) > cfg.turn_deadband_deg else 0.0
+        turn = -bearing * cfg.turn_gain if abs(bearing) > cfg.turn_deadband_deg else 0.0
         drive = 0.0
-        if dist is not None and abs(bearing) <= cfg.drive_max_bearing_deg \
+        if dist is not None and how != "near" and abs(bearing) <= cfg.drive_max_bearing_deg \
                 and dist > cfg.standoff_m + 0.1:
             drive = min(dist - cfg.standoff_m, cfg.max_step_m)
         # Turning right by `turn` moves every bearing left (+) by as much.
         self.expect = bearing + turn
-        return self._out("tracking", geo, box=box, bearing=bearing, dist=dist,
+        return self._out("tracking", geo, box=box, bearing=bearing, dist=dist, how=how,
                          turn_deg=turn, drive_m=drive)
 
     def _pick(self, rgb, persons, face_labels, bearings) -> Optional[int]:
@@ -269,6 +283,10 @@ class FollowSession:
                 if sim >= cfg.learn_similarity and (len(ok) == 1 or score - ok[1][0] > cfg.ambiguity):
                     self.learn(sig)
                 return i
+        # 1b. Lost and searching: the only person in view, in clothes like theirs and without
+        # someone else's face, is taken back (not learned).
+        elif len(persons) == 1 and cands and cands[0][2] >= cfg.continuity_similarity:
+            return cands[0][0]
 
         # 2. Anywhere in view: only a strong clothes match, and nothing is learned.
         W = rgb.shape[1]
@@ -283,18 +301,34 @@ class FollowSession:
                 best, best_score = i, score
         return best
 
-    def _distance(self, box, W, H, f, geo: Geometry) -> Optional[float]:
+    def _distance(self, box, W, H, f, geo: Geometry, face_px: Optional[float] = None):
+        """(metres, how): the TF-Luna on the box; else the feet on the floor; else
+        the face's size; else the box's width. (None, None) if none of them works."""
+        cfg = self.cfg
         r = geo.range_m
-        if r is not None and 0.1 < r <= self.cfg.max_range_m and box[0] <= W / 2.0 <= box[2]:
-            return r * math.cos(math.radians(geo.tilt_deg))
-        if box[3] >= H - 2:          # feet out of frame: no floor point
-            return None
-        below = math.radians(-geo.tilt_deg) + math.atan2(box[3] - H / 2.0, f)
-        if below <= math.radians(1.0):
-            return None
-        return geo.camera_height_m / math.tan(below)
+        if r is not None and 0.1 < r <= cfg.max_range_m and box[0] <= W / 2.0 <= box[2]:
+            return r * math.cos(math.radians(geo.tilt_deg)), "range"
+        # A box ending at (or a few px short of) the bottom edge is cut off there: the
+        # "feet" would be the frame edge, always the same distance whoever stands where.
+        near = None
+        if box[3] < H * (1.0 - cfg.bottom_margin):
+            below = math.radians(-geo.tilt_deg) + math.atan2(box[3] - H / 2.0, f)
+            if below > math.radians(1.0):
+                return geo.camera_height_m / math.tan(below), "floor"
+        else:                                          # feet cut off: nearer than where the floor comes into view
+            edge = math.radians(-geo.tilt_deg) + math.atan2(H / 2.0, f)
+            near = geo.camera_height_m / math.tan(edge) if edge > math.radians(1.0) else None
+        if face_px:
+            dist, how = f * cfg.face_width_m / face_px, "face"
+        elif box[0] > 1.0 and box[2] < W - 1.0:        # their whole width is in view
+            dist, how = f * cfg.body_width_m / max(box[2] - box[0], 1.0), "width"
+        else:
+            return None, None
+        # Legs alone are narrower than a body, so the guess reads too far and the robot crept in:
+        # with the feet out of frame it is at most `near`, and that is not driven on.
+        return (near, "near") if near is not None and dist > near else (dist, how)
 
-    def _out(self, state: str, geo: Geometry, box=None, bearing=None, dist=None,
+    def _out(self, state: str, geo: Geometry, box=None, bearing=None, dist=None, how=None,
              turn_deg: float = 0.0, drive_m: float = 0.0) -> dict:
         return {
             "state": state,                       # searching | tracking | holding | gone
@@ -304,6 +338,7 @@ class FollowSession:
             "bbox": [round(float(v), 1) for v in box] if box is not None else None,
             "bearing_deg": None if bearing is None else round(bearing, 1),
             "distance_m": None if dist is None else round(dist, 2),
+            "distance_from": how,                 # range | floor | face | width | near (feet cut off: at most this)
             "turn_deg": round(float(turn_deg), 1),
             "drive_m": round(float(drive_m), 2),
             "head": list(SEARCH_SWEEP[self.sweep - 1]) if self.sweep else [0, 0],
@@ -357,9 +392,9 @@ async def follow_step(
     persons = sorted((d for d in dets if d.cls == "person"),
                      key=lambda d: (d.bbox[2] - d.bbox[0]) * (d.bbox[3] - d.bbox[1]),
                      reverse=True)[:MAX_PERSONS]
-    labels = [await _face_label(st, rgb, p.bbox) for p in persons]
-    out = st.follow.step(rgb, persons, labels, Geometry(
-        pan_deg, tilt_deg, hfov_deg, camera_height_m, range_m))
+    faces = [await _face_label(st, rgb, p.bbox) for p in persons]
+    out = st.follow.step(rgb, persons, [label for label, _ in faces], Geometry(
+        pan_deg, tilt_deg, hfov_deg, camera_height_m, range_m), face_px=[w for _, w in faces])
     return {"seq": seq, "persons": len(persons), **out}
 
 
@@ -370,21 +405,23 @@ async def follow_stop(request: Request) -> dict:
     return {"target": st.follow.target, "followed": st.follow.followed}
 
 
-async def _face_label(st, rgb: np.ndarray, box) -> Optional[str]:
-    """Gallery label of the face in a person's head crop if above threshold;
-    STRANGER for a clear face that is plainly not the follow target (or, before
-    a "follow me" lock, nobody enrolled); None when there is no telling."""
+async def _face_label(st, rgb: np.ndarray, box) -> tuple[Optional[str], Optional[float]]:
+    """(label, face width in px). Label: the gallery label of the face in a person's
+    head crop if above threshold; STRANGER for a clear face that is plainly not the
+    follow target (or, before a "follow me" lock, nobody enrolled); None when there
+    is no telling. Width: None when no single face was found."""
     crop = head_crop(rgb, box)
     if min(crop.shape[:2]) < 32:
-        return None
+        return None, None
     face, _ = await st.runner.run(st.backend.face.embed, crop)
     if face is None or face.face_count > 1:
-        return None
+        return None, None
+    width = float(face.face_bbox[2] - face.face_bbox[0])
     matches = st.gallery.match(face.embedding, top_k=max(1, len(st.gallery.labels())))
     if matches and matches[0].similarity >= settings.match_threshold:
-        return matches[0].label
+        return matches[0].label, width
     want = st.follow.target or st.follow.label
     to_want = max((m.similarity for m in matches if want is None or m.label == want), default=0.0)
     if face.quality >= settings.face_min_quality and to_want < settings.face_reject_threshold:
-        return STRANGER
-    return None
+        return STRANGER, width
+    return None, width

@@ -34,6 +34,7 @@ class EmbedResponse(BaseModel):
     face_bbox: list[float] = Field(min_length=4, max_length=4)
     quality: float
     face_count: int = 1
+    face_bboxes: list[list[float]] = []      # every face, largest first: the Pi centres on each in turn
     model_version: str
     inference_ms: float
 

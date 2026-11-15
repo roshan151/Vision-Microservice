@@ -26,6 +26,7 @@ class FaceEmbedding:
     face_bbox: tuple[float, float, float, float]
     quality: float                             # 0..1; the Pi discards below ~0.6
     face_count: int = 1                        # faces in the image; >1 means ambiguous
+    face_bboxes: tuple = ()                    # every face's box, largest first (face_bbox is the first)
 
 
 class Detector(Protocol):

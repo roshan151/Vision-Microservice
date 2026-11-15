@@ -199,6 +199,7 @@ async def embed(
         face_bbox=list(result.face_bbox),
         quality=result.quality,
         face_count=result.face_count,
+        face_bboxes=[list(b) for b in result.face_bboxes] or [list(result.face_bbox)],
         model_version=st.backend.face.model_version,
         inference_ms=ms,
     )

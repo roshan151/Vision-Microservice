@@ -81,8 +81,8 @@ def test_drives_to_the_standoff_and_never_reverses():
     box = (290, 150, 350, 400)
     far = s.step(frame((box, RED)), [person(box)], [None], Geometry(range_m=2.0))
     assert far["distance_m"] == 2.0 and far["drive_m"] == pytest.approx(0.5)
-    mid = s.step(frame((box, RED)), [person(box)], [None], Geometry(range_m=1.5))
-    assert mid["drive_m"] == pytest.approx(0.3)
+    mid = s.step(frame((box, RED)), [person(box)], [None], Geometry(range_m=1.2))
+    assert mid["drive_m"] == pytest.approx(0.4)                     # to the 0.8 m standoff
     near = s.step(frame((box, RED)), [person(box)], [None], Geometry(range_m=0.6))
     assert near["drive_m"] == 0 and near["turn_deg"] == 0
 
@@ -92,10 +92,50 @@ def test_distance_from_feet_on_the_floor_without_a_range():
     # Feet 60 px below centre with fx = 320/tan(33°) ≈ 493 px: 6.9° down at 0.25 m high ≈ 2.06 m
     box = (290, 100, 350, 300)
     out = s.step(frame((box, RED)), [person(box)], [None], Geometry())
-    assert out["distance_m"] == pytest.approx(2.06, abs=0.05)
-    clipped = (290, 100, 350, H)                          # feet out of frame: unknown, so no drive
-    out = s.step(frame((clipped, RED)), [person(clipped)], [None], Geometry())
+    assert out["distance_m"] == pytest.approx(2.06, abs=0.05) and out["distance_from"] == "floor"
+
+
+def test_a_box_cut_by_the_bottom_edge_is_not_read_as_feet():
+    # Boxes cut off by the frame end a few px short of it: the old check took that
+    # edge for the feet and read ~0.9 m every time, so the robot never drove.
+    s = locked_session()
+    for bottom in (H, H - 8):
+        clipped = (265, 100, 375, bottom)                # head up 20 deg: the floor shows only beyond ~2.4 m
+        out = s.step(frame((clipped, RED)), [person(clipped)], [None], Geometry(tilt_deg=20.0))
+        assert out["distance_from"] == "width"           # 0.45 m across 110 px: ~2.0 m
+        assert out["distance_m"] == pytest.approx(2.0, abs=0.1) and out["drive_m"] == pytest.approx(0.5)
+
+
+def test_legs_filling_the_frame_are_not_read_as_far_away():
+    # Feet out of frame with the head up 10 deg means nearer than ~0.87 m. Legs are narrower than
+    # a body, so the width said ~1.5 m and the robot crept in to the knees, then lost them.
+    s = locked_session()
+    legs = (245, 0, 395, H)
+    out = s.step(frame((legs, RED)), [person(legs)], [None], Geometry(tilt_deg=10.0))
+    assert out["state"] == "tracking" and out["distance_from"] == "near"
+    assert out["distance_m"] == pytest.approx(0.87, abs=0.05) and out["drive_m"] == 0
+
+
+def test_a_visible_face_gives_the_distance_when_the_feet_do_not():
+    s = locked_session()
+    clipped = (290, 100, 350, H)
+    out = s.step(frame((clipped, RED)), [person(clipped)], [None], Geometry(tilt_deg=20.0), face_px=[80.0])
+    assert out["distance_from"] == "face"                # 0.16 m across 80 px: ~0.99 m
+    assert out["distance_m"] == pytest.approx(0.99, abs=0.03) and out["drive_m"] == pytest.approx(0.19, abs=0.03)
+
+
+def test_no_distance_when_nothing_tells_it():
+    s = locked_session()
+    huge = (0, 100, W, H)                                # cut at the sides and the bottom, no face
+    out = s.step(frame((huge, RED)), [person(huge)], [None], Geometry())
     assert out["distance_m"] is None and out["drive_m"] == 0
+
+
+def test_turns_only_part_of_the_way_so_it_does_not_swing_back_and_forth():
+    s = locked_session()
+    box = (40, 100, 120, 400)
+    out = s.step(frame((box, RED)), [person(box)], [None], Geometry())
+    assert out["turn_deg"] == pytest.approx(-0.6 * out["bearing_deg"], abs=0.1)
 
 
 def test_lost_holds_then_sweeps_the_head_then_gives_up():
@@ -160,13 +200,19 @@ def test_keeps_them_when_they_turn_round_and_knows_their_back_later():
     assert out["state"] == "tracking" and out["target"] == "roshan"
 
 
-def test_an_unlearned_back_view_far_from_where_they_were_is_not_taken():
+def test_while_searching_a_weak_match_is_taken_back_only_when_they_are_alone_in_view():
+    far, other = (40, 100, 120, 400), (500, 100, 580, 400)
+    weak = dressed(frame(), far, GREEN, RED, BLACK, share=0.6)      # an unlearned back view, elsewhere
+
     s = locked_session()
     while s.step(frame(), [], [], Geometry())["state"] != "searching":
         pass
-    far = (40, 100, 120, 400)
-    out = s.step(dressed(frame(), far, GREEN, RED, BLACK, share=0.6), [person(far)], [None], Geometry())
-    assert out["state"] != "tracking"
+    sim = s.similarity(signature(weak, far))
+    assert s.cfg.continuity_similarity <= sim < s.cfg.reacquire_similarity
+    both = dressed(weak.copy(), other, BLUE, BLUE)
+    assert s.step(both, [person(far), person(other)], [None, None], Geometry())["state"] != "tracking"
+    assert s.step(weak, [person(far)], [STRANGER], Geometry())["state"] != "tracking"
+    assert s.step(weak, [person(far)], [None], Geometry())["state"] == "tracking", "alone: it is them"
 
 
 def test_same_clothes_but_a_strangers_face_is_not_followed():
@@ -262,7 +308,7 @@ def test_a_clear_face_that_is_not_the_target_is_a_stranger(follow_client):
     st = c.app.state
     c.post("/v1/follow/start", json={"label": "roshan"})
     rgb = frame(((280, 100, 360, 400), RED))
-    assert asyncio.run(_face_label(st, rgb, (280, 100, 360, 400))) == "Roshan"
+    assert asyncio.run(_face_label(st, rgb, (280, 100, 360, 400)))[0] == "Roshan"
     st.backend.face = OtherFace()
-    assert asyncio.run(_face_label(st, rgb, (280, 100, 360, 400))) == STRANGER
+    assert asyncio.run(_face_label(st, rgb, (280, 100, 360, 400)))[0] == STRANGER
     assert _step(c, 1).json()["locked"] is False
