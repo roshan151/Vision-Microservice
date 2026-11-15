@@ -107,13 +107,16 @@ def test_a_box_cut_by_the_bottom_edge_is_not_read_as_feet():
 
 
 def test_legs_filling_the_frame_are_not_read_as_far_away():
-    # Feet out of frame with the head up 10 deg means nearer than ~0.87 m. Legs are narrower than
-    # a body, so the width said ~1.5 m and the robot crept in to the knees, then lost them.
+    # Cut off at the top and the bottom they are close. Legs are narrower than a body, so the
+    # width said ~1.5 m and the robot crept in to the knees.
     s = locked_session()
     legs = (245, 0, 395, H)
     out = s.step(frame((legs, RED)), [person(legs)], [None], Geometry(tilt_deg=10.0))
     assert out["state"] == "tracking" and out["distance_from"] == "near"
-    assert out["distance_m"] == pytest.approx(0.87, abs=0.05) and out["drive_m"] == 0
+    assert out["drive_m"] == 0
+    far = (265, 250, 375, H)                             # feet cut off but not the top: they are not near
+    out = s.step(frame((far, RED)), [person(far)], [None], Geometry(tilt_deg=10.0))
+    assert out["distance_from"] == "width" and out["drive_m"] == pytest.approx(0.5)
 
 
 def test_a_visible_face_gives_the_distance_when_the_feet_do_not():
