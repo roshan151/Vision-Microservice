@@ -323,7 +323,7 @@ service.
 
 ### Debug uploads (`debug_api.py`)
 
-Not inference: the robot's `debug_mode` (robot.yaml `/voice debug_mode: true`) sends the camera frames and ToF grids its tasks collect, at most 2 a second, and they are stored exactly as sent for Monitoring-Sensors (`sensor_view.py`) to show.
+Not inference: the robot's `debug_mode` (robot.yaml `/voice debug_mode: true`) sends the camera frames and ToF grids its tasks collect, at most 2 a second, and they are stored exactly as sent for Monitoring-Service (`tof_camera_overlaid.py`) to show.
 
 | Endpoint | Body | Stores / returns |
 |---|---|---|

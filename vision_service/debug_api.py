@@ -1,5 +1,5 @@
 """Debug uploads from the robot (robot.yaml /voice debug_mode): the camera frames and
-ToF grids a task collects, stored as they come for Monitoring-Sensors to show. No
+ToF grids a task collects, stored as they come for Monitoring-Service to show. No
 inference here, and nothing is decoded: the JPEG is written exactly as it arrived.
 
     POST /v1/debug/frame     meta (JSON form field) [+ image (JPEG)] -> stored
