@@ -315,3 +315,105 @@ def test_a_clear_face_that_is_not_the_target_is_a_stranger(follow_client):
     st.backend.face = OtherFace()
     assert asyncio.run(_face_label(st, rgb, (280, 100, 360, 400)))[0] == STRANGER
     assert _step(c, 1).json()["locked"] is False
+
+
+def grid(v=None, box=None, inside=None):
+    """An 8x8 ToF grid of `v`, with `inside` in the zones a camera box covers (W x H, hfov 66)."""
+    from vision_service.follow import range_in_box
+    g = [[v] * 8 for _ in range(8)]
+    if box is not None:
+        for r in range(8):
+            for c in range(8):
+                one = [[None] * 8 for _ in range(8)]
+                one[r][c] = 1.0
+                if range_in_box(one, box, W, H, 66.0) is not None:
+                    g[r][c] = inside
+    return g
+
+
+def test_range_in_box_takes_the_zones_on_the_box_and_the_nearest_for_a_small_one():
+    from vision_service.follow import range_in_box
+    g = grid(3.0, (280, 100, 360, 400), 1.5)
+    assert range_in_box(g, (280, 100, 360, 400), W, H, 66.0) == 1.5
+    assert range_in_box(g, (0, 0, 10, 10), W, H, 66.0) is None          # outside the ToF's 60 degrees
+    assert range_in_box(None, (280, 100, 360, 400), W, H, 66.0) is None
+
+
+def test_the_tof_zones_on_the_person_give_the_distance():
+    s = locked_session()
+    box = (280, 100, 360, 400)
+    out = s.step(frame((box, RED)), [person(box)], [None], Geometry(tof_grid=grid(3.0, box, 2.0)))
+    assert out["distance_from"] == "tof" and out["distance_m"] == 2.0
+    assert out["drive_m"] == 0.5
+
+
+def test_a_lookalike_at_the_wrong_range_is_not_taken_back():
+    box = (280, 100, 360, 400)
+    s = locked_session(box)
+    s.step(frame((box, RED)), [person(box)], [None], Geometry(tof_grid=grid(3.0, box, 1.4)))   # at 1.4 m
+    assert s.expect_dist == pytest.approx(0.9)                       # 1.4, less the 0.5 it drove
+    img = frame((box, RED))
+    far = s.step(img, [person(box)], [None], Geometry(tof_grid=grid(None, box, 4.5)))
+    assert far["state"] != "tracking", "same clothes, but 4.5 m away where they should be at 0.9"
+    near = s.step(img, [person(box)], [None], Geometry(tof_grid=grid(None, box, 1.2)))
+    assert near["state"] == "tracking"
+    # A face is never overruled by the range.
+    s2 = locked_session(box)
+    s2.step(img, [person(box)], [None], Geometry(tof_grid=grid(3.0, box, 1.4)))
+    assert s2.step(img, [person(box)], ["roshan"], Geometry(tof_grid=grid(None, box, 4.5)))["state"] == "tracking"
+
+
+def test_the_search_starts_where_the_robot_says_they_were_last_seen():
+    s = locked_session()
+    outs = [s.step(frame(), [], [], Geometry(hint_deg=45.0)) for _ in range(5)]
+    assert [o["state"] for o in outs[:3]] == ["holding"] * 3
+    assert outs[3]["head"] == [45, 0] and outs[4]["head"] == list(SEARCH_SWEEP[0])
+    s = locked_session()
+    outs = [s.step(frame(), [], [], Geometry(hint_deg=-150.0)) for _ in range(5)]
+    assert outs[3]["state"] == "searching" and outs[3]["turn_deg"] == 150.0 and outs[3]["head"] == [0, 0], \
+        "behind the robot, past what the head reaches: the robot turns (right, 150) to look"
+    assert outs[4]["turn_deg"] == 0                                  # once: then the usual sweep
+
+
+def test_follow_step_takes_the_tof_grid_and_the_hint(follow_client):
+    import json
+    c = follow_client
+    c.post("/v1/follow/start", json={"label": "roshan"})
+    _step(c, 1)
+    ok = _step(c, 2, tof_grid=json.dumps([[2.0] * 8 for _ in range(8)]), hint_deg="30")
+    assert ok.status_code == 200, ok.text
+    assert ok.json()["distance_from"] in ("tof", "range", "floor", "face", "width", "near")
+    bad = _step(c, 3, tof_grid=json.dumps([[1.0] * 4]))
+    assert bad.status_code == 422
+
+
+def test_a_lost_search_gives_up_after_search_s_even_mid_sweep():
+    t = [0.0]
+    s = FollowSession(clock=lambda: t[0])
+    s.start("roshan")
+    box = (280, 100, 360, 400)
+    for _ in range(2):
+        s.step(frame((box, RED)), [person(box)], ["roshan"], Geometry())
+    s.step(frame((box, RED)), [person(box)], [None], Geometry())          # tracking
+    outs = []
+    for _ in range(7):                                                   # lost: a step every 4 s
+        outs.append(s.step(frame(), [], [], Geometry()))
+        t[0] += 4.0
+    assert [o["state"] for o in outs[:3]] == ["holding"] * 3
+    assert [o["state"] for o in outs[3:6]] == ["searching"] * 3          # up to 20 s
+    assert outs[6]["state"] == "gone", "lost at 0 s, past 20 s: gone, though the sweep was not done"
+    assert len(SEARCH_SWEEP) <= 8
+
+
+def test_tracking_answers_carry_measurements_for_the_pi():
+    """bearing in the robot frame, distance uncertainty by method, ground position, confidence."""
+    from vision_service.follow import FollowSession, Geometry
+    s = FollowSession()
+    g = Geometry(camera_height_m=0.25)
+    assert s._sigma(1.0, "tof", g) == pytest.approx(0.07)
+    assert s._sigma(2.0, "floor", g) == pytest.approx(4.0 / 0.25 * 0.017453, rel=1e-3)
+    assert s._sigma(2.0, "width", g) == pytest.approx(0.6)
+    out = s._out("tracking", g, bearing=30.0, dist=2.0, how="tof", confidence=0.8)
+    assert out["ground_xy"] == pytest.approx([1.732, 1.0], abs=1e-3)
+    assert out["distance_sigma_m"] == pytest.approx(0.09) and out["confidence"] == 0.8
+    assert s._out("searching", g)["ground_xy"] is None

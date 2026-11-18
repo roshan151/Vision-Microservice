@@ -94,6 +94,12 @@ class Settings:
     slam_res_m: float = field(default_factory=lambda: _env_f("VS_SLAM_RES_M", 0.05))
     robot_radius_m: float = field(default_factory=lambda: _env_f("VS_ROBOT_RADIUS_M", 0.18))
 
+    # --- debug uploads from the robot (debug_api.py) ----------------------
+    debug_dir: Path = field(
+        default_factory=lambda: Path(_env("VS_DEBUG_DIR", str(_REPO / "debug"))).expanduser()
+    )
+    debug_keep: int = field(default_factory=lambda: _env_i("VS_DEBUG_KEEP", 20))   # sessions kept
+
     # --- limits ----------------------------------------------------------
     # Bounded intake. The Pi sends ~30 KB frames; anything near this cap means
     # the Pi is misconfigured and it is cheaper to say so than to process it.

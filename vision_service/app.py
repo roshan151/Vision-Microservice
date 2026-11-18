@@ -21,6 +21,7 @@ from fastapi.responses import JSONResponse
 
 from . import images, photos
 from .backends import build_backend
+from .debug_api import router as debug_router
 from .explore_api import router as explore_router
 from .follow import FollowSession, router as follow_router
 from .gallery import Gallery
@@ -70,6 +71,7 @@ app = FastAPI(
 )
 app.include_router(explore_router)
 app.include_router(follow_router)
+app.include_router(debug_router)
 setup_logging()
 app.add_middleware(RequestLog)      # one timestamped in/out line per request (reqlog.py)
 

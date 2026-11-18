@@ -13,7 +13,8 @@ error shape); state lives on app.state, built in app.lifespan.
     POST   /v1/ask                 images + question -> answer  (Gemini / local)
 
     POST   /v1/slam/keyframe       odom + rays -> corrected pose + next goal
-    POST   /v1/slam/plan           path between two map points
+    POST   /v1/slam/plan           path between two map points (+ clear_m per leg)
+    GET    /v1/slam/walls          straight walls with their lengths, and the explored area's size
     POST   /v1/slam/viewpoints     reachable poses around a target
     POST   /v1/slam/reset          new run (optionally on a saved map)
     POST   /v1/slam/save           save the map (also done after every keyframe)
@@ -72,7 +73,7 @@ async def plant_embed(request: Request, image: UploadFile = File(...), seq: int 
 class PlantMatchIn(BaseModel):
     embedding: list[float] = Field(min_length=1)
     top_k: int = Field(3, ge=1, le=25)
-    position: Optional[list[float]] = Field(None, description="[x, y] on the map, if known")
+    position: Optional[list[float]] = Field(None, description="[x, y] or [x, y, height] on the map, if known")
 
 
 @router.post("/v1/plants/match", tags=["plants"])
@@ -81,14 +82,16 @@ async def plant_match(request: Request, body: PlantMatchIn) -> dict:
 
     Appearance and place are returned separately on purpose: the robot decides.
     Same place + similar look = the same plant. Similar look but 3 m away =
-    moved, or a sibling — the case worth asking /v1/ask about.
+    moved, or a sibling — the case worth asking /v1/ask about. `distance_m` is
+    along the floor; `position` carries the height too ([x, y, height]) when it
+    was measured, so two plants on one stand can be told apart by shelf.
     """
     store = request.app.state.plants
     try:
         matches = store.gallery.match(np.asarray(body.embedding, np.float32), top_k=body.top_k)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    where = dict((l, (x, y)) for l, x, y in store.positions())
+    where = {l: [x, y] + ([z] if z is not None else []) for l, x, y, z in store.positions()}
     out = []
     for m in matches:
         p = where.get(m.label)
@@ -227,6 +230,10 @@ class KeyframeIn(BaseModel):
     rays: list[list[Optional[float]]] = Field(description="[[bearing_rad, range_m|null], ...] in base_link")
     sensor_xy: list[float] = Field([0.0, 0.0], min_length=2, max_length=2)
     obstacles: list[list[float]] = Field([], description="[[x, y]] in base_link: low obstacles / drops")
+    low: list[list[float]] = Field([], description="[[x, y]] in base_link: low obstacles seen by the ToF grid")
+    drops: list[list[float]] = Field([], description="[[x, y]] in base_link: the floor falls away here")
+    clear: list[list[float]] = Field([], description="[[bearing_rad, range_m]]: floor seen that far, nothing in the way")
+    cloud: list[list[float]] = Field([], description="[[x, y, height_m]] in base_link: every ToF reading")
     plan: bool = True
 
 
@@ -257,8 +264,10 @@ async def slam_keyframe(request: Request, body: KeyframeIn, background: Backgrou
     for r in body.rays:
         if len(r) != 2 or r[0] is None:
             raise HTTPException(status_code=422, detail="each ray is [bearing_rad, range_m|null]")
+    if any(len(p) != 2 for p in body.low + body.drops + body.clear) or any(len(p) != 3 for p in body.cloud):
+        raise HTTPException(status_code=422, detail="low, drops, clear are pairs; cloud is [x, y, height]")
     out = await run_in_threadpool(s.add_keyframe, body.odom, body.rays, body.sensor_xy,
-                                  body.obstacles, body.plan)
+                                  body.obstacles, body.plan, body.low, body.drops, body.clear, body.cloud)
     # The Pi keeps nothing: the map is written to the Mac after every keyframe, so a
     # crash or a dead battery mid-run loses at most the scan in flight.
     background.add_task(_save_map, request.app.state)
@@ -266,7 +275,8 @@ async def slam_keyframe(request: Request, body: KeyframeIn, background: Backgrou
 
 
 def _save_map(st) -> str:
-    """maps/<name>.npz (reloadable) and maps/<name>.png (plants marked)."""
+    """maps/<name>.npz (reloadable: walls, low obstacles, drops, the 3-D points)
+    and maps/<name>.png (plants marked, with their height)."""
     path = st.slam.save(settings.slam_dir)
     path.with_suffix(".png").write_bytes(st.slam.render(2, st.plants.positions()))
     return str(path)
@@ -274,10 +284,17 @@ def _save_map(st) -> str:
 
 @router.post("/v1/slam/plan", tags=["slam"])
 async def slam_plan(request: Request, body: PlanIn) -> dict:
-    path = await run_in_threadpool(request.app.state.slam.plan, body.start[:2], body.goal[:2])
+    s = request.app.state.slam
+    path = await run_in_threadpool(s.plan, body.start[:2], body.goal[:2])
     if path is None:
         raise HTTPException(status_code=422, detail="no path: goal unknown, blocked or unreachable")
-    return {"path": path}
+    return {"path": path, "clear_m": await run_in_threadpool(s.clearances, path)}
+
+
+@router.get("/v1/slam/walls", tags=["slam"])
+async def slam_walls(request: Request) -> dict:
+    """Straight walls fitted to the map (each with its length) and the explored area's size."""
+    return await run_in_threadpool(request.app.state.slam.walls)
 
 
 @router.post("/v1/slam/viewpoints", tags=["slam"])

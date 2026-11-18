@@ -14,4 +14,6 @@ __pycache__/
 /plants/
 /faces/
 /maps/
+# Debug uploads from the robot (camera frames: personal data).
+/debug/
 .DS_Store

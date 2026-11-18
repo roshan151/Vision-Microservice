@@ -118,3 +118,109 @@ def test_exploration_respects_radius():
     assert not first_keyframe()["done"]
     assert not first_keyframe(radius_m=10, no_behind=True)["done"]
     assert first_keyframe(radius_m=0.05)["done"]        # every frontier is farther than that
+
+
+def test_tof_layers_low_drops_clear_and_cloud(tmp_path):
+    """What the 8x8 ToF adds: free space without a wall, places never to drive, 3-D points."""
+    s = SlamSession(SlamConfig(size_m=16), name="tof")
+    short = [[b, min(r, 1.0)] for b, r in scan((0, 0, 0))]       # a sensor that only reaches 1 m ...
+    walls = [r for r in short if r[1] < 1.0]
+    clear = [r for r in short if r[1] >= 1.0]                     # ... sees only floor in most directions
+    s.add_keyframe((0, 0, 0), walls, clear=clear,
+                   low=[[0.6, 0.0]], drops=[[0.0, 0.7]],
+                   cloud=[[0.6, 0.0, 0.08], [0.6, 0.0, 0.08], [1.0, 0.2, 1.4]])
+    g = s.grid
+    cell = lambda x, y: tuple(g.cells(np.array([[x, y]]))[0][::-1])
+    assert g.free()[cell(0.8, 0.0)] and not g.occupied()[cell(1.0, 0.0)], "clear rays carve, and leave no wall"
+    trav = s._trav()
+    assert trav[cell(0.0, -0.5)]
+    assert not trav[cell(0.6, 0.0)] and not trav[cell(0.45, 0.0)], "a low obstacle, and the robot's width around it"
+    assert not trav[cell(0.0, 0.7)] and not trav[cell(0.0, 0.55)], "a drop, kept clear of"
+    assert s.plan((0, 0), (0.0, 0.7)) is None or s.plan((0, 0), (0.0, 0.7))[-1] != pytest.approx([0.0, 0.7], abs=0.1)
+    st = s.state()
+    assert st["low_cells"] == 1 and st["drop_cells"] == 1 and st["cloud_points"] == 2   # same 5 cm cube: one point
+
+    # Later rays passing over the step do not erase it.
+    for _ in range(5):
+        s.add_keyframe((0, 0, 0), walls, clear=clear)
+    assert not s._trav()[cell(0.6, 0.0)]
+
+    png = s.render(marks=[("plant_001", 1.0, 1.0, 0.0), ("plant_002", 1.0, 1.0, 0.7), ("plant_003", 0.5, 0.5)])
+    assert png[:4] == b"\x89PNG"
+    s.save(tmp_path)
+    t = SlamSession(SlamConfig(size_m=16), name="tof")
+    t.load(tmp_path)
+    assert t.low.sum() == 1 and t.drops.sum() == 1 and len(t.cloud) == 2
+    assert t.cloud[:, 2].max() == pytest.approx(1.4)
+    t.reset()
+    assert not t.low.any() and len(t.cloud) == 0, "a new map starts empty"
+
+
+def test_maps_saved_before_the_tof_layers_still_load(tmp_path):
+    s = SlamSession(SlamConfig(size_m=16), name="old")
+    s.add_keyframe((0, 0, 0), scan((0, 0, 0)))
+    np.savez(tmp_path / "old.npz", logodds=s.grid.logodds, res=s.grid.res, origin=s.grid.origin, keyframes="[]")
+    t = SlamSession(SlamConfig(size_m=16), name="old")
+    t.load(tmp_path)
+    assert not t.low.any() and t.grid.occupied().any()
+
+
+def _drive_round(s, truth, odom_drift_deg=0.0, odom_scale=1.0, rng=None):
+    """Keyframes along `truth` with odometry that lies by odom_scale and odom_drift_deg per leg."""
+    rng = rng or np.random.default_rng(3)
+    odom, outs = truth[0], [s.add_keyframe(truth[0], scan(truth[0], rng=rng))]
+    for prev, cur in zip(truth, truth[1:]):
+        d = between(prev, cur)
+        odom = compose(odom, (d[0] * odom_scale, d[1] * odom_scale, d[2] + math.radians(odom_drift_deg)))
+        outs.append(s.add_keyframe(odom, scan(cur, rng=rng)))
+    return outs
+
+
+def test_a_loop_coming_back_off_is_closed_and_the_poses_in_between_corrected(monkeypatch):
+    """With keyframe-to-keyframe matching switched off, the chain drifts; back at the start,
+    the loop match against the old keyframes puts it right and spreads the fix back."""
+    import vision_service.slam as slam
+    real = slam.match_scan
+
+    def no_sequential(grid, field_, prior, pts, xy_window=0.4, **kw):
+        if xy_window == 0.4:                       # the ordinary and the "recent" matches: drift on
+            return slam.MatchResult(tuple(prior), 0.0, False)
+        return real(grid, field_, prior, pts, xy_window=xy_window, **kw)
+    monkeypatch.setattr(slam, "match_scan", no_sequential)
+    s = SlamSession(SlamConfig(size_m=16))
+    truth = [(0, 0, 0), (1, 0, 0), (1.8, 0, 0), (1.8, 1.8, 1.57), (0.8, 2.2, 3.14),
+             (0, 2.2, 3.14), (-0.4, 1.2, -1.57), (0.1, 0.1, 0.0)]
+    outs = _drive_round(s, truth, odom_drift_deg=2.0)
+    assert outs[-1]["loop"]["closed"], outs[-1]["loop"]
+    x, y, th = outs[-1]["pose"]
+    assert math.hypot(x - truth[-1][0], y - truth[-1][1]) < 0.08
+    drifted = [o["match"]["prior"] for o in outs]
+    for kf, true, before in zip(s.keyframes[5:7], truth[5:7], drifted[5:7]):
+        err_now = math.hypot(kf.pose[0] - true[0], kf.pose[1] - true[1])
+        err_before = math.hypot(before[0] - true[0], before[1] - true[1])
+        assert err_now < err_before, (kf.kf_id, err_now, err_before)
+
+
+def test_no_loop_without_enough_travel_and_ordinary_runs_unchanged():
+    s = SlamSession(SlamConfig(size_m=16))
+    outs = _drive_round(s, [(0, 0, 0), (0.5, 0, 0), (0.5, 0.5, 1.0), (0, 0.5, 2.0), (0, 0, 3.0), (0.2, 0.1, 0.0)])
+    assert not any(o["loop"]["closed"] for o in outs)
+
+
+def test_walls_and_room_size_from_the_map():
+    s = SlamSession(SlamConfig(size_m=16))
+    _drive_round(s, [(0, 0, 0), (2, 1.8, 1.0), (4, 0, 2.0), (0.5, 2.2, -1.0), (4.2, 2.2, 3.0)])
+    out = s.walls()
+    lengths = [w["length_m"] for w in out["walls"]]
+    assert lengths[0] > 5.0 and sum(1 for L in lengths if L > 3.0) >= 3, lengths
+    ext = out["extent"]
+    assert abs(ext["length_m"] - 6.0) < 0.2 and abs(ext["width_m"] - 4.0) < 0.2, ext
+
+
+def test_paths_keep_clear_where_they_can_and_say_how_clear():
+    s = SlamSession(SlamConfig(size_m=16))
+    _drive_round(s, [(0, 0, 0), (2, 1.8, 1.0), (4, 0, 2.0), (0.5, 2.2, -1.0), (4.2, 2.2, 3.0)])
+    path = s.plan((0.0, 0.0), (4.2, 1.6))
+    assert path is not None
+    clear = s.clearances(path)
+    assert len(clear) == len(path) and min(clear[1:]) >= s.config.robot_radius + s.config.clearance - 0.05

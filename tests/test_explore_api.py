@@ -120,3 +120,40 @@ def test_every_keyframe_saves_the_map_on_the_mac(client):
     r = client.post("/v1/slam/keyframe", json={"odom": [0, 0, 0], "rays": rays})
     assert r.status_code == 200, r.text
     assert (settings.slam_dir / "home.npz").is_file() and (settings.slam_dir / "home.png").read_bytes()[:4] == b"\x89PNG"
+
+
+def test_two_plants_on_one_stand_keep_their_heights(client):
+    """Same x, y; different shelves. The match gives each one's height back so the robot can tell them apart."""
+    low, high = jpeg(320, 240, (40, 140, 60)), jpeg(320, 240, (45, 150, 70))
+    for img, z in ((low, 0.0), (high, 0.7)):
+        meta = {"position": [1.0, 2.0, z], "height_m": z, "on_stand": True}
+        r = client.post("/v1/plants/enroll", data={"meta": json.dumps(meta)},
+                        files=[("images", ("p.jpg", img, "image/jpeg"))])
+        assert r.status_code == 200, r.text
+    listing = {p["label"]: p["position"] for p in client.get("/v1/plants").json()["plants"]}
+    assert listing == {"plant_001": [1.0, 2.0, 0.0], "plant_002": [1.0, 2.0, 0.7]}
+    m = client.post("/v1/plants/match", json={"embedding": _embed(client, high), "position": [1.0, 2.0, 0.7],
+                                              "top_k": 2}).json()
+    by = {x["label"]: x for x in m["matches"]}
+    assert by["plant_002"]["position"] == [1.0, 2.0, 0.7] and by["plant_001"]["position"] == [1.0, 2.0, 0.0]
+    assert by["plant_002"]["distance_m"] == 0.0 and by["plant_001"]["distance_m"] == 0.0     # along the floor
+    assert client.get("/v1/slam/map.png").content[:4] == b"\x89PNG"
+
+
+def test_keyframe_takes_the_tof_layers(client):
+    rays = [[math.radians(a), 2.0] for a in range(0, 360, 10)]
+    r = client.post("/v1/slam/keyframe", json={"odom": [0, 0, 0], "rays": rays, "low": [[0.6, 0.0]],
+                                               "drops": [[0.0, 0.7]], "clear": [[0.1, 1.5]],
+                                               "cloud": [[0.6, 0.0, 0.08]]})
+    assert r.status_code == 200, r.text
+    st = client.get("/v1/slam/state").json()
+    assert st["low_cells"] == 1 and st["drop_cells"] == 1 and st["cloud_points"] == 1
+    bad = client.post("/v1/slam/keyframe", json={"odom": [0, 0, 0], "rays": rays, "cloud": [[1.0, 2.0]]})
+    assert bad.status_code == 422
+
+
+def test_plant_position_is_the_median_of_its_visits():
+    from vision_service.plants import combine_positions
+    pos, spread = combine_positions([[1.0, 2.0, 0.3], [1.1, 2.1, 0.32], [3.0, 5.0, 0.3]])
+    assert pos == [1.1, 2.1, 0.3] and abs(spread - ((1.9 ** 2 + 2.9 ** 2) ** 0.5)) < 1e-3
+    assert combine_positions([[1.0, 2.0]]) == ([1.0, 2.0], 0.0)

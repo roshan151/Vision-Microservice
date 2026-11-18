@@ -40,6 +40,17 @@ class BadLabel(ValueError):
     pass
 
 
+def combine_positions(positions: list) -> tuple:
+    """One plant position from every visit's ([x, y] or [x, y, height]): the median of
+    each coordinate (one bad ranging cannot drag it), and how far the visits' x, y spread
+    from it (m). A plant measured once has spread 0."""
+    import statistics
+    n = min(len(p) for p in positions)
+    mid = [round(statistics.median(p[i] for p in positions), 3) for i in range(n)]
+    spread = max(((p[0] - mid[0]) ** 2 + (p[1] - mid[1]) ** 2) ** 0.5 for p in positions)
+    return mid, round(spread, 3)
+
+
 def check_label(label: str) -> str:
     # Labels become directory names: refuse anything that could escape the root.
     if not LABEL_RE.match(label or ""):
@@ -108,7 +119,8 @@ class PlantStore:
                 **{k: v for k, v in meta.items() if k not in ("views", "position")},
             })
             if meta.get("position") is not None:
-                m["position"] = meta["position"]
+                m["position"], m["position_spread_m"] = combine_positions(
+                    [v["position"] for v in m["visits"] if v.get("position")])
             m["updated"] = stamp
             m["n_views"] = sum(len(v["views"]) for v in m["visits"])
             tmp = folder / "meta.json.tmp"
@@ -128,7 +140,10 @@ class PlantStore:
         return out
 
     def positions(self) -> list[tuple]:
-        return [(m["label"], *m["position"][:2]) for m in self.list() if m.get("position")]
+        """(label, x, y, height) of every plant: x, y on the map, height of the pot's
+        base above the floor (None if it was never measured)."""
+        return [(m["label"], *m["position"][:2], m["position"][2] if len(m["position"]) > 2 else None)
+                for m in self.list() if m.get("position")]
 
     def remove(self, label: str) -> int:
         """Forget a plant. Photos are moved to _deleted/, never destroyed."""

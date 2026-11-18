@@ -263,17 +263,46 @@ Full request/response shapes: `http://<mac>:8080/docs`.
 | Endpoint | What it does |
 |---|---|
 | `POST /v1/plants/embed` | Plant crop → DINOv2 embedding |
-| `POST /v1/plants/match` | Embedding (+ map position) → best plants, each with similarity **and** distance from where it was last seen |
+| `POST /v1/plants/match` | Embedding (+ map position `[x, y]` or `[x, y, height]`) → best plants, each with similarity, its stored position (with height, when measured) **and** floor distance from where it was last seen |
 | `POST /v1/plants/enroll` | Photos + meta → a new `plant_NNN`, or a new visit when `label` is an existing plant. Embeddings are stored before it answers; the photos are written by a background task to `plants/map_{index}/plant_{NNN}/photo_{i}.png` + `bbox_{i}.txt` (`x1 y1 x2 y2` of the potted plant, empty if none found). `map_{index}` is bumped by each new `POST /v1/slam/reset` |
 | `GET /v1/plants` · `GET /v1/plants/{label}` · `GET /v1/plants/{label}/{file}` · `DELETE /v1/plants/{label}` | Register admin; delete moves photos to `_deleted/` |
 | `POST /v1/ask` | Images + question → answer from Gemini, or a local VLM via Ollama. `json=true` also parses the answer |
-| `POST /v1/slam/keyframe` | Odometry pose + TF-Luna rays → corrected pose, `map_to_odom`, next unexplored goal and path |
-| `POST /v1/slam/plan` · `POST /v1/slam/viewpoints` | Path between two points; reachable poses around a plant |
+| `POST /v1/slam/keyframe` | Odometry pose + rays (+ from the 8x8 ToF: `clear` free-space rays, `low` obstacles, `drops`, `cloud` 3-D points) → corrected pose, `map_to_odom`, `loop` (see below), next unexplored goal and path, with `goal.clear_m`: how close each leg passes to anything mapped (the robot drives roomy legs whole). Everything is saved in `maps/<name>.npz` |
+| `POST /v1/slam/plan` · `POST /v1/slam/viewpoints` | Path between two points (+ `clear_m` per leg); reachable poses around a plant. Paths keep 0.15 m more room from walls where the map allows (`pref_clearance`), else take the tightest way |
+| `GET /v1/slam/walls` | Straight walls fitted to the map, each with its length, and `extent`: the explored area's length and width along its main directions (several rooms explored together make one extent) |
 | `POST /v1/slam/reset` · `POST /v1/slam/save` · `GET /v1/slam/state` | Runs and saved maps (`reset` with `load: true` continues a saved map from a given start pose) |
-| `GET /v1/slam/map.png` | The map: free white, walls black, robot trail blue, plants red |
+| `GET /v1/slam/map.png` | The map: free white, walls black, low obstacles orange, drops (stairs down) magenta, robot trail blue, plants red with their height (plants on one stand listed together) |
 
 SLAM and `/v1/ask` run in worker threads, never through the GPU runner, so a
 slow map update or a 10 s VLM answer never delays `/v1/detect`.
+
+**Loop closure.** When a keyframe is back within 1.5 m of one taken at least 5
+keyframes and 3 m of driving ago, its scan is matched against the old keyframes
+alone. If they agree (fit at least 0.5) and the robot's chain of poses has drifted,
+the correction is spread along the keyframes in between, and the map is rebuilt
+from their stored readings. The keyframe answer's `loop` says what happened:
+`{"closed": true, "with_kf", "score", "correction_m", "correction_deg"}` or
+`{"closed": false}`. It works within one run; a run continuing a saved map
+rebuilds on top of the loaded map.
+
+**Plant positions** are the median of every visit's measured position (one bad
+ranging cannot drag it), with `position_spread_m` saying how far the visits
+disagree.
+
+### Follow mode: `POST /v1/follow/step` measurements
+
+Each `tracking` answer carries what the robot needs to decide its own move:
+- `bearing_deg`: in the robot's frame, with the head's pan added; + is left.
+- `distance_m` with `distance_from`, and `distance_sigma_m`, how far off it may be:
+  - ToF zones: about 5 cm
+  - feet on the floor: d²/h per degree of tilt error
+  - face size: 15 %
+  - box width: 30 %
+- `ground_xy`: where they stand, metres ahead and left of the robot when the frame was taken.
+- `confidence`: 1.0 for a face match, else how well their clothes match.
+
+`turn_deg` and `drive_m` are still sent. The robot uses them only while
+searching; while tracking, its own person tracker decides the turn and the leg.
 
 ### `GET /healthz` · `GET /v1/models` — ops
 
@@ -291,6 +320,17 @@ slow map update or a 10 s VLM answer never delays `/v1/detect`.
 The field worth alerting on is **`queue_depth` climbing**: requests are arriving
 faster than the GPU retires them. `backend` is always `"real"` in the running
 service.
+
+### Debug uploads (`debug_api.py`)
+
+Not inference: the robot's `debug_mode` (robot.yaml `/voice debug_mode: true`) sends the camera frames and ToF grids its tasks collect, at most 2 a second, and they are stored exactly as sent for Monitoring-Sensors (`sensor_view.py`) to show.
+
+| Endpoint | Body | Stores / returns |
+|---|---|---|
+| `POST /v1/debug/frame` | form field `meta` (JSON: `session`, `n`, `ts`, `frame`, `tof.rows` in metres, `geometry`, `extras`), optional `image` (JPEG) | `debug/<session>/<n>.jpg` and `.json` (plus `received`, this Mac's clock); `debug/latest.json` points at the newest |
+| `GET /v1/debug/latest` | | the newest upload's meta |
+
+Folder: `VS_DEBUG_DIR` (default `debug/` next to the code, gitignored). Only the newest `VS_DEBUG_KEEP` sessions (default 20) are kept; starting a new one deletes the oldest beyond that.
 
 ---
 
