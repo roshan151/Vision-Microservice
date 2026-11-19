@@ -24,6 +24,7 @@ from .backends import build_backend
 from .debug_api import router as debug_router
 from .explore_api import router as explore_router
 from .follow import FollowSession, router as follow_router
+from .nav_api import NavSession, router as nav_router
 from .gallery import Gallery
 from .plants import BadLabel, PlantStore, check_label
 from .reqlog import RequestLog, setup as setup_logging
@@ -51,6 +52,7 @@ async def lifespan(app: FastAPI):
     app.state.slam = SlamSession(SlamConfig(
         size_m=settings.slam_size_m, res=settings.slam_res_m, robot_radius=settings.robot_radius_m))
     app.state.follow = FollowSession()
+    app.state.nav = NavSession()                      # global map, Theta*, visual SLAM (nav_api.py)
     app.state.started_at = time.monotonic()
     log.info(
         "ready in %.1fs — backend=%s versions=%s gallery=%s",
@@ -71,6 +73,7 @@ app = FastAPI(
 )
 app.include_router(explore_router)
 app.include_router(follow_router)
+app.include_router(nav_router)
 app.include_router(debug_router)
 setup_logging()
 app.add_middleware(RequestLog)      # one timestamped in/out line per request (reqlog.py)

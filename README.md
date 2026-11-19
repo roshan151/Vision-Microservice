@@ -334,6 +334,27 @@ Folder: `VS_DEBUG_DIR` (default `debug/` next to the code, gitignored). Only the
 
 ---
 
+## Global navigation (`nav_api.py`)
+
+The robot drives itself locally (DWA on a rolling costmap, `robot_core/nav` on the Pi); this
+service is its long-horizon layer.
+
+| Endpoint | What |
+|---|---|
+| `POST /v1/nav/frame` | the camera stream (~10 fps): `image`, `t`, `pose` (JSON x, y, heading), `pan_deg`, `tilt_deg` (real) -> visual SLAM |
+| `POST /v1/nav/plan` | `{pose, goal, radius_m, local}` -> `{path}`: Theta* waypoints in the Pi's odometry frame; `local` (the Pi's costmap) is folded into the map first |
+| `GET /v1/nav/state` | map size, plans, SLAM backend/tracking/scale, `odom_to_map` |
+| `GET /v1/nav/map.png` | the map: occupied black, free white, unknown grey, camera-found furniture orange, last path blue, robot red |
+| `POST /v1/nav/reset` | a new map |
+
+Visual SLAM is ORB-SLAM3 (monocular; metric scale from odometry). It is optional: install it
+with `bash deploy/install_orbslam3_macos.sh` (Homebrew deps, Pangolin, ORB-SLAM3, vocabulary,
+Python bindings, then a check). Until then `/v1/nav/state` shows `"backend": "none"` and the map
+runs on the Pi's odometry. Settings: `VS_ORB_VOCAB`, `VS_VSLAM=0` to turn it off,
+`VS_CAMERA_HFOV_DEG`, `VS_HEAD_X_M` / `VS_HEAD_Y_M` / `VS_HEAD_HEIGHT_M` (match robot.yaml).
+Calibrate the camera for best results: the intrinsics written to `~/.robot-vision/vslam/camera.yaml`
+are estimated from the field of view. ORB-SLAM3 is GPLv3.
+
 ## Errors
 
 Every failure returns the same shape, so the Pi parses one thing:

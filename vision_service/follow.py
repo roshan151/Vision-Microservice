@@ -80,6 +80,7 @@ from pydantic import BaseModel
 
 from . import images
 from .backends.base import Detection
+from .nav_api import project_detections
 from .settings import settings
 
 
@@ -107,6 +108,7 @@ class FollowConfig:
     hold_frames: int = 3             # misses before searching
     search_s: float = 20.0           # once locked, lost this long (holding + sweep) is "gone"
     max_range_m: float = 6.0         # TF-Luna readings beyond this are ignored
+    min_person_range_m: float = 0.4  # nearer than this, a person fills most of the frame
     range_tol_m: float = 1.2         # ToF range this far from where the target should be: not them by clothes
     range_tol_grow_m: float = 0.5    # ...plus this per missed frame (they walk on while lost)
 
@@ -264,8 +266,11 @@ class FollowSession:
         bearings = [geo.pan_deg + math.degrees(math.atan2(W / 2.0 - (p.bbox[0] + p.bbox[2]) / 2.0, f))
                     for p in persons]
         ranges = [range_in_box(geo.tof_grid, p.bbox, W, H, geo.hfov_deg, geo.tof_fov_deg) for p in persons]
+        # A range this near on a box that does not fill the frame is not them: the zones caught a
+        # wall or door jamb beside them (Nov 18: "tracking Roshan at 0.14 m", facing a wall).
         ranges = [None if r is None or not 0.1 < r <= cfg.max_range_m
-                  else r * math.cos(math.radians(geo.tilt_deg)) for r in ranges]
+                  or (r < cfg.min_person_range_m and p.bbox[3] - p.bbox[1] < 0.7 * H)
+                  else r * math.cos(math.radians(geo.tilt_deg)) for r, p in zip(ranges, persons)]
         pick = self._pick(rgb, persons, face_labels, bearings, ranges)
 
         if pick is None:
@@ -494,6 +499,7 @@ async def follow_step(
     tof_grid: Optional[str] = Form(None, description="JSON 8x8 ToF ranges in m (null = no return), row 0 the top"),
     tof_fov_deg: float = Form(60.0),
     hint_deg: Optional[float] = Form(None, description="where they were last seen, from the robot's heading (+ left)"),
+    pose: Optional[str] = Form(None, description="JSON (x, y, heading): the robot's odometry pose when the frame was taken"),
 ) -> dict:
     """One frame of follow mode -> where the person is and how to move:
     turn `turn_deg` (+ right) then drive `drive_m`. state `gone` = give up."""
@@ -510,6 +516,9 @@ async def follow_step(
             raise HTTPException(status_code=422, detail="tof_grid must be 8 rows of 8 ranges (m) or null") from exc
     rgb = images.decode(await image.read())
     dets, _ = await st.runner.run(st.backend.detector.detect, rgb, 0.4)
+    if pose:                                          # chairs, sofas, bins...: onto the global map (nav_api.py)
+        project_detections(getattr(st, "nav", None), dets, rgb.shape[1], rgb.shape[0], pan_deg, tilt_deg,
+                           hfov_deg, camera_height_m, json.loads(pose))
     persons = sorted((d for d in dets if d.cls == "person"),
                      key=lambda d: (d.bbox[2] - d.bbox[0]) * (d.bbox[3] - d.bbox[1]),
                      reverse=True)[:MAX_PERSONS]
