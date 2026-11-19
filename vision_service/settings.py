@@ -100,8 +100,8 @@ class Settings:
         "VS_ORB_VOCAB", str(Path.home() / ".robot-vision" / "orbslam3" / "ORBvoc.txt")))
     vslam_enabled: bool = field(default_factory=lambda: _env("VS_VSLAM", "1") not in ("0", "false", "no"))
     camera_hfov_deg: float = field(default_factory=lambda: _env_f("VS_CAMERA_HFOV_DEG", 80.0))   # robot.yaml hfov_deg
-    head_x_m: float = field(default_factory=lambda: _env_f("VS_HEAD_X_M", 0.05))        # robot.yaml pan_axis_x_m
-    head_y_m: float = field(default_factory=lambda: _env_f("VS_HEAD_Y_M", -0.0275))     # tof_from_right_m - width/2
+    head_x_m: float = field(default_factory=lambda: _env_f("VS_HEAD_X_M", 0.0))         # robot.yaml pan_axis_x_m (gimbal at the centre)
+    head_y_m: float = field(default_factory=lambda: _env_f("VS_HEAD_Y_M", -0.025))      # tof_from_right_m - width/2 (0.10 - 0.125)
     head_height_m: float = field(default_factory=lambda: _env_f("VS_HEAD_HEIGHT_M", 0.22))  # robot.yaml head_height_m
 
     # --- debug uploads from the robot (debug_api.py) ----------------------

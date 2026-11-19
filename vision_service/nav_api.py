@@ -1,7 +1,7 @@
 """The global navigation layer's endpoints (the Pi's local layer: robot_core/nav).
 
     POST /v1/nav/frame     the camera stream (~10 fps): JPEG, capture time, odometry pose, head pan
-                           and real tilt -> visual SLAM (vslam.py)
+                           and real tilt, the ToF grid nearest it -> visual SLAM (vslam.py)
     POST /v1/nav/plan      {pose, goal, radius_m, local} -> {path: waypoints in the Pi's odometry
                            frame}. The Pi's rolling costmap (`local`) is folded into the global map
                            first; Theta* plans in the map frame (corrected by visual SLAM)
@@ -27,6 +27,7 @@ from pydantic import BaseModel
 from starlette.concurrency import run_in_threadpool
 
 from .nav_map import GlobalMap, apply, compose, inverse
+from .nav_record import NavRecorder
 from .settings import settings
 from .vslam import MonoVSLAM
 
@@ -47,6 +48,11 @@ class NavSession:
                                enabled=settings.vslam_enabled)
         self.plans = self.failed = 0
         self.last_plan_ms = 0.0
+        self.record = NavRecorder(status=lambda: {"vslam": self.vslam.state(), "map": self.map.stats(),
+                                                  "map_origin": self.map.origin, "orb_vocab": settings.orb_vocab,
+                                                  "camera_hfov_deg": settings.camera_hfov_deg,
+                                                  "mount": [settings.head_x_m, settings.head_y_m, settings.head_height_m]})
+        self.vslam.record = self.record
 
     @property
     def odom_to_map(self) -> tuple:
@@ -56,17 +62,30 @@ class NavSession:
         self.map = GlobalMap(settings.slam_size_m, settings.slam_res_m)
 
 
+def _inside(box, other) -> float:
+    """How much of `box` lies inside `other` (0..1)."""
+    w = max(0.0, min(box[2], other[2]) - max(box[0], other[0]))
+    h = max(0.0, min(box[3], other[3]) - max(box[1], other[1]))
+    area = max(1e-6, (box[2] - box[0]) * (box[3] - box[1]))
+    return w * h / area
+
+
 def project_detections(nav: Optional[NavSession], dets, W: int, H: int, pan_deg: float, tilt_deg: float,
                        hfov_deg: float, camera_height_m: float, pose) -> int:
     """Floor-standing obstacles the detector found, onto the global map. tilt_deg: the head's real
-    tilt above level (as follow gets it). Returns how many were placed."""
+    tilt above level (as follow gets it). Anything mostly inside a person's box is part of them, not
+    in their way: on Nov 19 the followed person's feet were taken for a skateboard and a cat, the
+    planner went round them, and the robot turned away and lost them. Returns how many were placed."""
     if nav is None or pose is None:
         return 0
     f = (W / 2.0) / math.tan(math.radians(hfov_deg) / 2.0)
     to_map = compose(nav.odom_to_map, pose)
+    people = [d.bbox for d in dets if d.cls == "person"]
     n = 0
     for d in dets:
         if d.cls not in OBSTACLES or d.bbox[3] >= H * 0.97:      # bottom cut off: no floor contact seen
+            continue
+        if any(_inside(d.bbox, p) > 0.4 for p in people):       # their feet, bag, a pet in their arms
             continue
         below = math.radians(-tilt_deg) + math.atan2(d.bbox[3] - H / 2.0, f)
         if below <= math.radians(2.0):
@@ -79,6 +98,8 @@ def project_detections(nav: Optional[NavSession], dets, W: int, H: int, pan_deg:
         r = dist + width / 4.0                              # the box's bottom edge is its near side
         xy = apply(to_map, [(r * math.cos(bearing), r * math.sin(bearing))])[0]
         nav.map.add_semantic((float(xy[0]), float(xy[1])), max(0.12, min(0.6, width / 2.0)), d.cls)
+        nav.record("semantic", cls=d.cls, xy=[float(xy[0]), float(xy[1])], radius=max(0.12, min(0.6, width / 2.0)),
+                   dist=dist, bearing_deg=math.degrees(bearing), pose=list(pose), odom_to_map=list(nav.odom_to_map))
         n += 1
     return n
 
@@ -93,10 +114,12 @@ def _nav(request: Request) -> NavSession:
 @router.post("/v1/nav/frame", tags=["nav"])
 async def nav_frame(request: Request, image: UploadFile = File(...), t: float = Form(...),
                     pose: Optional[str] = Form(None), pan_deg: float = Form(0.0),
-                    tilt_deg: float = Form(0.0)) -> dict:
-    """One frame of the robot's camera stream, for visual SLAM. tilt_deg is the head's REAL tilt."""
+                    tilt_deg: float = Form(0.0), tof: Optional[str] = Form(None)) -> dict:
+    """One frame of the robot's camera stream, for visual SLAM. tilt_deg is the head's REAL tilt;
+    tof: {"rows", "age_s"}, the ToF grid nearest the frame (gives SLAM its metric scale)."""
     nav = _nav(request)
-    nav.vslam.feed(await image.read(), t, json.loads(pose) if pose else None, pan_deg, tilt_deg)
+    nav.vslam.feed(await image.read(), t, json.loads(pose) if pose else None, pan_deg, tilt_deg,
+                   json.loads(tof) if tof else None)
     return {"vslam": nav.vslam.backend, "tracking": nav.vslam.tracking}
 
 
@@ -113,8 +136,7 @@ async def nav_plan(request: Request, body: PlanIn) -> dict:
     nav = _nav(request)
     t0 = time.monotonic()
     o2m = nav.odom_to_map
-    if body.local:
-        nav.map.fold_local(body.local, o2m)
+    folded = nav.map.fold_local(body.local, o2m) if body.local else 0
     start = compose(o2m, body.pose)
     nav.map.robot = start
     goal = apply(o2m, [body.goal[:2]])[0]
@@ -122,6 +144,12 @@ async def nav_plan(request: Request, body: PlanIn) -> dict:
                                    body.radius_m)          # not the inference queue: planning is CPU only
     nav.last_plan_ms = (time.monotonic() - t0) * 1000.0
     nav.plans += 1
+    map_file = nav.record.save_map(nav.map) if nav.record.map_due() else None
+    nav.record("plan", pose=body.pose, goal=body.goal, radius_m=body.radius_m, odom_to_map=list(o2m),
+               start_map=list(start), goal_map=[float(goal[0]), float(goal[1])], folded_cells=folded,
+               path_map=path or [], path_odom=apply(inverse(o2m), path).tolist() if path else [],
+               margin_m=getattr(nav.map, "last_margin", None), ms=nav.last_plan_ms, ok=bool(path),
+               vslam_tracking=nav.vslam.tracking, map=map_file)
     if not path:
         nav.failed += 1
         return {"path": [], "odom_to_map": list(o2m), "ms": round(nav.last_plan_ms, 1)}
@@ -145,5 +173,7 @@ async def nav_map_png(request: Request) -> Response:
 
 @router.post("/v1/nav/reset", tags=["nav"])
 async def nav_reset(request: Request) -> dict:
-    _nav(request).reset()
+    nav = _nav(request)
+    nav.reset()
+    nav.record("reset")
     return {"ok": True}

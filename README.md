@@ -347,13 +347,23 @@ service is its long-horizon layer.
 | `GET /v1/nav/map.png` | the map: occupied black, free white, unknown grey, camera-found furniture orange, last path blue, robot red |
 | `POST /v1/nav/reset` | a new map |
 
-Visual SLAM is ORB-SLAM3 (monocular; metric scale from odometry). It is optional: install it
+Visual SLAM is ORB-SLAM3 (monocular). Its metric scale comes from the ToF: the Pi sends the ToF grid
+nearest each frame, and the depths of the points ORB-SLAM3 tracks are compared with the ranges of the
+zones that see a flat surface there (corrected for each zone reporting the nearest point in its cone).
+Odometry only levels and places the map, and gives the scale until the ToF has 8 agreeing views. It is optional: install it
 with `bash deploy/install_orbslam3_macos.sh` (Homebrew deps, Pangolin, ORB-SLAM3, vocabulary,
 Python bindings, then a check). Until then `/v1/nav/state` shows `"backend": "none"` and the map
 runs on the Pi's odometry. Settings: `VS_ORB_VOCAB`, `VS_VSLAM=0` to turn it off,
 `VS_CAMERA_HFOV_DEG`, `VS_HEAD_X_M` / `VS_HEAD_Y_M` / `VS_HEAD_HEIGHT_M` (match robot.yaml).
 Calibrate the camera for best results: the intrinsics written to `~/.robot-vision/vslam/camera.yaml`
 are estimated from the field of view. ORB-SLAM3 is GPLv3.
+
+While a robot debug session is receiving uploads, everything this layer computes is saved beside
+them in `debug/<session>/nav/` (`nav_record.py`): `nav.jsonl` (SLAM status, every tracked frame,
+every SLAM pose and the base pose derived from it, each `odom_to_map` correction, the odometry fit
+with its point pairs, new-map events, every plan with its path, margin and timing, and camera-placed
+objects) and `map-NNNNNN.npz` snapshots of the global map (at most one per 2 s). Monitoring-Service's
+`tof_camera_overlaid.py --nav --session S` replays them next to the robot's own uploads.
 
 ## Errors
 
@@ -471,7 +481,7 @@ That runs, in order, stopping at the first failure:
 | Python environment | `.venv/` in this folder |
 | Your settings | `.env` in this folder (optional, see [Configuration](#configuration)) |
 | launchd job | `~/Library/LaunchAgents/com.roshan.visionservice.plist`, generated from `deploy/com.roshan.visionservice.plist.in` by `make start`, so its paths always point at this checkout |
-| Log | `~/Library/Logs/vision-service/vision-service.log`. The previous run's log is kept as `.log.1`. One timestamped line per request: client, endpoint, status, time taken, the inputs (uploaded images as name, bytes and pixel size; form fields) and the answer (embeddings shortened to `<512 numbers>`); see `vision_service/reqlog.py` |
+| Log | `~/Library/Logs/Vision-and-Planning/vision-and-planning.log`. The previous run's log is kept as `.log.1`. One timestamped line per request: client, endpoint, status, time taken, the inputs (uploaded images as name, bytes and pixel size; form fields) and the answer (embeddings shortened to `<512 numbers>`); see `vision_service/reqlog.py` |
 | Face gallery | `~/.robot-vision/gallery.npz` (`VS_GALLERY_PATH`) |
 | Model weights | Downloaded on first start: YOLO into this folder (gitignored), InsightFace into `~/.insightface`, Depth Anything into `~/.cache/huggingface` |
 

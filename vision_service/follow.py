@@ -155,8 +155,8 @@ def range_in_box(grid, box, W: int, H: int, hfov_deg: float, tof_fov_deg: float 
                 good.append(v)
             elif right - half < lf < left + half and bottom - half < up < top + half:
                 touched.append(v)
-    if good:
-        return float(np.median(good))
+    if good:   # the near third: zones between legs see the wall behind (Nov 19: 1 m flipped to 2.4 m)
+        return float(np.percentile(good, 30))
     return min(touched) if touched else None
 
 

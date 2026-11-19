@@ -21,15 +21,15 @@ LABEL          := com.roshan.visionservice
 DOMAIN         := gui/$(shell id -u)
 PLIST_SRC      := deploy/$(LABEL).plist.in
 PLIST_DST      := $(HOME)/Library/LaunchAgents/$(LABEL).plist
-LOG_DIR        := $(HOME)/Library/Logs/vision-service
-LOG_FILE       := $(LOG_DIR)/vision-service.log
+LOG_DIR        := $(HOME)/Library/Logs/Vision-and-Planning
+LOG_FILE       := $(LOG_DIR)/vision-and-planning.log
 
 HEALTH_URL     := http://127.0.0.1:$(VS_PORT)/healthz
 # First start after install downloads model weights; give it time.
 HEALTH_TIMEOUT ?= 180
 
 .PHONY: help install reinstall test run deploy start restart stop uninstall \
-        status health logs wait-healthy clean
+        status health logs wait-healthy clean FORCE
 
 help: ## Show this list
 	@grep -E '^[a-z-]+:.*## ' $(firstword $(MAKEFILE_LIST)) | \
@@ -37,14 +37,18 @@ help: ## Show this list
 
 # ---------------------------------------------------------------- build ---
 
-install: $(STAMP) ## Create .venv and install deps (only redoes work when pyproject.toml changes)
+install: $(STAMP) ## Create .venv and install deps (only redoes work when pyproject.toml or requirements.txt change)
 
-$(STAMP): pyproject.toml
+$(STAMP): pyproject.toml requirements.txt
 	@test -d $(VENV) || { \
 	  $(PYTHON) -c 'import sys; sys.exit(sys.version_info < (3, 10))' \
 	    || { echo "Need Python >= 3.10 (macOS's own python3 is 3.9). Try: brew install python, or make PYTHON=python3.12 install"; exit 1; }; \
 	  $(PYTHON) -m venv $(VENV); }
 	$(PY) -m pip install --quiet --upgrade pip
+	@# The package was called robot-vision-service before: drop that install, which still maps
+	@# vision_service to the old Vision-Microservice folder.
+	-@$(PY) -m pip uninstall --quiet -y robot-vision-service 2>/dev/null
+	$(PY) -m pip install -r requirements.txt
 	$(PY) -m pip install -e '.[models,dev]'
 	@touch $@
 
@@ -52,16 +56,24 @@ reinstall: ## Delete .venv and install everything from scratch
 	rm -rf $(VENV)
 	@$(MAKE) --no-print-directory install
 
-test: $(STAMP) ## Run the test suite (~1 s, no models or GPU needed)
-	$(PY) -m pytest -q
+# The test suite lives in Monitoring-Service now; this only checks the service imports and every
+# router is mounted, so `make deploy` never restarts into a broken app.
+test: $(STAMP) ## Check the app imports and its routes are all there (~2 s, no models loaded)
+	$(PY) -c "import vision_service.app as a; p = a.app.openapi()['paths']; \
+	missing = [r for r in ('/healthz', '/v1/follow/step', '/v1/nav/plan', '/v1/slam/keyframe', '/v1/debug/frame') if r not in p]; \
+	assert not missing, f'routes missing: {missing}'; print(f'app OK: {len(p)} routes')"
 
 # -------------------------------------------------------------- service ---
 
 deploy: install test start ## Rebuild after a change: install if needed, test, restart, wait until healthy
 
 # The installed plist is generated from the template, so its paths always
-# point at this checkout. Re-rendered whenever the template changes.
-$(PLIST_DST): $(PLIST_SRC)
+# point at this checkout. Re-rendered whenever the template changes, and whenever
+# it points at another folder or log file (the repo was moved or renamed: launchd
+# would try to start a run.sh that is not there, or log where nobody looks).
+PLIST_STALE := $(shell grep -qsF '$(CURDIR)/run.sh' $(PLIST_DST) && grep -qsF '$(LOG_FILE)' $(PLIST_DST) || echo FORCE)
+FORCE:
+$(PLIST_DST): $(PLIST_SRC) $(PLIST_STALE)
 	@mkdir -p $(dir $@) $(LOG_DIR)
 	sed -e 's|__REPO_DIR__|$(CURDIR)|g' -e 's|__LOG_FILE__|$(LOG_FILE)|g' $< > $@
 	@plutil -lint -s $@

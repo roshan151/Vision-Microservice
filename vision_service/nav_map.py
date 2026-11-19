@@ -174,7 +174,7 @@ class GlobalMap:
         fresh = (self.sem_t > 0) & (time.monotonic() - self.sem_t < self.semantic_keep_s)
         return (self.lo > self.OCC_T) | fresh
 
-    def plan(self, start: XY, goal: XY, radius_m: float, margin_m: float = 0.10,
+    def plan(self, start: XY, goal: XY, radius_m: float, margin_m: float = 0.05,
              border_m: float = 2.0) -> Optional[List[XY]]:
         """Waypoints (map frame) from start to goal, the start first; None: no way."""
         s, g = self.cell(start), self.cell(goal)
@@ -190,6 +190,7 @@ class GlobalMap:
         ls, lg = (s[0] - x0, s[1] - y0), (g[0] - x0, g[1] - y0)
         penalty = np.clip((radius_m + 0.4 - field) / 0.4, 0.0, 1.0) * 2.0 + unknown * 0.3
         for margin in (margin_m, 0.03):
+            self.last_margin = margin
             free = field >= radius_m + margin
             if not free[ls]:                                   # starting in the margin: may leave it
                 free |= field >= max(0.0, field[ls] - 1e-3)
