@@ -262,11 +262,11 @@ class MonoVSLAM:
         if not enabled:
             self.reason = "disabled (VS_VSLAM=0)"
             return
-        try:
-            import orbslam3                                # noqa: F401
-            self._orb = orbslam3
-        except Exception as exc:                           # noqa: BLE001
-            self.reason = f"orbslam3 not installed ({type(exc).__name__}): run deploy/install_orbslam3_macos.sh"
+        # Only look for it here: loading it into this process (beside torch and the venv's OpenCV) aborts
+        # the service on a second OpenMP runtime. It runs in a process of its own (_OrbProcess).
+        import importlib.util
+        if importlib.util.find_spec("orbslam3") is None:
+            self.reason = "orbslam3 not installed: run deploy/install_orbslam3_macos.sh"
             return
         if not vocab or not os.path.exists(vocab):
             self.reason = f"ORB vocabulary not found at {vocab!r} (VS_ORB_VOCAB)"
@@ -311,14 +311,22 @@ class MonoVSLAM:
                 self._track(*item)
             except Exception as exc:                       # noqa: BLE001
                 log.warning("vslam: %s: %s", type(exc).__name__, exc)
+                if "process exited" in str(exc) or "did not start" in str(exc):   # gone: carry on without it
+                    self.backend, self.reason, self.tracking = "none", f"ORB-SLAM3 stopped: {exc}", False
+                    self.record("slam_stopped", reason=str(exc))
+                    return
 
     def _start(self, w: int, h: int) -> None:
         self.work_dir.mkdir(parents=True, exist_ok=True)
         cfg = settings_yaml(self.work_dir / "camera.yaml", w, h, self.hfov)
-        sys_ = self._orb.System(self.vocab, str(cfg), self._orb.Sensor.MONOCULAR)
-        if hasattr(sys_, "set_use_viewer"):
-            sys_.set_use_viewer(False)
-        sys_.initialize()
+        if os.environ.get("VS_VSLAM_INPROC") == "1":       # tests (a stand-in module): in this process
+            import orbslam3
+            sys_ = orbslam3.System(self.vocab, str(cfg), orbslam3.Sensor.MONOCULAR)
+            if hasattr(sys_, "set_use_viewer"):
+                sys_.set_use_viewer(False)
+            sys_.initialize()
+        else:
+            sys_ = _OrbProcess(self.vocab, str(cfg))
         self._sys = sys_
         log.info("vslam: ORB-SLAM3 monocular started (%dx%d, hfov %.0f)", w, h, self.hfov)
 
@@ -440,6 +448,84 @@ class MonoVSLAM:
         p = s * Rs @ p_wb + ts
         fwd = Rs @ R_wb @ np.array([1.0, 0.0, 0.0])
         return float(p[0]), float(p[1]), math.atan2(fwd[1], fwd[0])
+
+
+def _plain(v):
+    """A binding's result as plain Python, to cross the pipe (an enum becomes its name, or its number)."""
+    if v is None or type(v) in (bool, int, float, str):      # exact types: an enum is an int subclass, and
+        return v                                            # unpickling it would load the binding here
+    if isinstance(v, (list, tuple)) or (hasattr(v, "__iter__") and not hasattr(v, "keys")):
+        return [_plain(x) for x in v]
+    if isinstance(v, (int, float)):                         # an enum or a numpy scalar: plain number
+        return int(v) if isinstance(v, int) else float(v)
+    text = str(v)
+    try:
+        return int(v) if not any(ch.isalpha() for ch in text) else text.rsplit(".", 1)[-1]
+    except (TypeError, ValueError):
+        return text
+
+
+def _orb_child(conn, vocab: str, cfg: str) -> None:
+    """The ORB-SLAM3 process: builds the System, then answers calls on it until told to stop."""
+    import orbslam3
+    sys_ = orbslam3.System(vocab, cfg, orbslam3.Sensor.MONOCULAR)
+    if hasattr(sys_, "set_use_viewer"):
+        sys_.set_use_viewer(False)
+    sys_.initialize()
+    conn.send(("ready", None))
+    while True:
+        name, args = conn.recv()
+        if name == "shutdown":
+            sys_.shutdown()
+            conn.send(("ok", None))
+            return
+        try:
+            conn.send(("ok", _plain(getattr(sys_, name)(*args))))
+        except Exception as exc:                           # noqa: BLE001 — reported in the service's log
+            conn.send(("err", f"{type(exc).__name__}: {exc}"))
+
+
+class _OrbProcess:
+    """ORB-SLAM3 in a process of its own, called like the binding's System. Loaded into the service
+    itself, its OpenMP (Homebrew's, through OpenCV 4) and torch's own clash ("OMP: Error #15") and the
+    service aborts at start; apart, neither sees the other. A crash there stops visual SLAM, not the service."""
+
+    METHODS = ("process_image_mono", "get_tracking_state", "get_trajectory_points", "get_tracked_mappoints")
+
+    def __init__(self, vocab: str, cfg: str, timeout_s: float = 120.0) -> None:
+        import multiprocessing as mp
+        ctx = mp.get_context("spawn")                      # a fresh interpreter: none of torch's libraries
+        self._conn, child = ctx.Pipe()
+        self._proc = ctx.Process(target=_orb_child, args=(child, vocab, cfg), name="orbslam3", daemon=True)
+        self._proc.start()
+        self._lock = threading.Lock()
+        end = time.monotonic() + timeout_s                 # the vocabulary takes a few seconds to load
+        while not self._conn.poll(0.2):
+            if not self._proc.is_alive() or time.monotonic() > end:
+                raise RuntimeError(f"ORB-SLAM3 process did not start (exit code {self._proc.exitcode})")
+        self._conn.recv()
+
+    def _call(self, name: str, *args):
+        with self._lock:
+            try:
+                self._conn.send((name, args))
+                kind, value = self._conn.recv()
+            except (EOFError, OSError, BrokenPipeError) as exc:
+                raise RuntimeError(f"ORB-SLAM3 process exited (code {self._proc.exitcode})") from exc
+        if kind == "err":
+            raise RuntimeError(value)
+        return value
+
+    def __getattr__(self, name: str):
+        if name in self.METHODS:
+            return lambda *args: self._call(name, *args)
+        raise AttributeError(name)
+
+    def shutdown(self) -> None:
+        try:
+            self._call("shutdown")
+        finally:
+            self._proc.join(timeout=5.0)
 
 
 def _compose(a, b) -> tuple:

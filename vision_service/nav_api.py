@@ -33,11 +33,14 @@ from .vslam import MonoVSLAM
 
 router = APIRouter()
 
-# COCO classes that stand on the floor and block a small robot (people are followed, not avoided).
-OBSTACLES = {"chair", "couch", "bed", "dining table", "toilet", "potted plant", "bench", "suitcase",
-             "backpack", "handbag", "bicycle", "motorcycle", "dog", "cat", "tv", "refrigerator",
-             "oven", "sink", "vase", "sports ball", "skateboard", "umbrella"}
-SEMANTIC_MAX_M = 3.0             # floor projection gets poor beyond this
+# COCO classes that stand on the floor and block a small robot (people are followed, not avoided). Left out:
+# what stands against a wall (refrigerator, oven, sink, toilet, tv: the ToF sees the wall anyway, and a white door
+# was a "refrigerator" 15 times in one doorway on Nov 19), animals (they move), and what feet and legs were taken
+# for (skateboard, sports ball, umbrella).
+OBSTACLES = {"chair", "couch", "bed", "dining table", "potted plant", "bench", "suitcase",
+             "backpack", "handbag", "bicycle", "motorcycle", "vase"}
+SEMANTIC_MIN_CONF = 0.55         # a guess is not an obstacle
+SEMANTIC_MAX_M = 2.0             # floor projection gets poor beyond this: at 2-3 m a suitcase was put 0.4-0.6 m too far (Nov 19)
 
 
 class NavSession:
@@ -83,7 +86,7 @@ def project_detections(nav: Optional[NavSession], dets, W: int, H: int, pan_deg:
     people = [d.bbox for d in dets if d.cls == "person"]
     n = 0
     for d in dets:
-        if d.cls not in OBSTACLES or d.bbox[3] >= H * 0.97:      # bottom cut off: no floor contact seen
+        if d.cls not in OBSTACLES or d.confidence < SEMANTIC_MIN_CONF or d.bbox[3] >= H * 0.97:   # no floor contact seen
             continue
         if any(_inside(d.bbox, p) > 0.4 for p in people):       # their feet, bag, a pet in their arms
             continue
