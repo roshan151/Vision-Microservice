@@ -103,6 +103,8 @@ class Settings:
     head_x_m: float = field(default_factory=lambda: _env_f("VS_HEAD_X_M", 0.0))         # robot.yaml pan_axis_x_m (gimbal at the centre)
     head_y_m: float = field(default_factory=lambda: _env_f("VS_HEAD_Y_M", -0.025))      # tof_from_right_m - width/2 (0.10 - 0.125)
     head_height_m: float = field(default_factory=lambda: _env_f("VS_HEAD_HEIGHT_M", 0.22))  # robot.yaml head_height_m
+    tof_pan_offset_deg: float = field(default_factory=lambda: _env_f("VS_TOF_PAN_OFFSET_DEG", 0.0))
+    tof_tilt_offset_deg: float = field(default_factory=lambda: _env_f("VS_TOF_TILT_OFFSET_DEG", 0.0))
 
     # --- debug uploads from the robot (debug_api.py) ----------------------
     debug_dir: Path = field(

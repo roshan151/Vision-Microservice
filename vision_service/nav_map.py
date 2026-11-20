@@ -164,9 +164,16 @@ class GlobalMap:
         """Something the camera recognised standing at map xy, about radius_m across."""
         c = self.cell(xy)
         r = max(1, int(math.ceil(radius_m / self.res)))
+        # The same thing seen again replaces where it was put before: each sighting lands a little elsewhere
+        # (0.4 m further at 2 m), and their union grew a suitcase into a 1 m blob over the person beside it,
+        # so every way to them went round it (Nov 19).
+        k = r + int(math.ceil(0.3 / self.res))
+        oi, oj = np.mgrid[c[0] - k:c[0] + k + 1, c[1] - k:c[1] + k + 1]
+        old = ((oi - c[0]) ** 2 + (oj - c[1]) ** 2 <= k * k) & self._inside(oi, oj)
         ii, jj = np.mgrid[c[0] - r:c[0] + r + 1, c[1] - r:c[1] + r + 1]
         disc = ((ii - c[0]) ** 2 + (jj - c[1]) ** 2 <= r * r) & self._inside(ii, jj)
         with self._lock:
+            self.sem_t[oi[old], oj[old]] = 0.0
             self.sem_t[ii[disc], jj[disc]] = time.monotonic()
             self.sem_label[c] = label
 
@@ -175,37 +182,63 @@ class GlobalMap:
         return (self.lo > self.OCC_T) | fresh
 
     def plan(self, start: XY, goal: XY, radius_m: float, margin_m: float = 0.05,
-             border_m: float = 2.0) -> Optional[List[XY]]:
-        """Waypoints (map frame) from start to goal, the start first; None: no way."""
+             border_m: float = 2.0, target: Optional[XY] = None) -> Optional[List[XY]]:
+        """Waypoints (map frame) from start to goal, the start first; None: no way. `target`: what the
+        goal is for (the person the robot stops short of): the goal must be on the target's side of any
+        wall. Nov 19: the goal 0.5 m short of a person standing just behind a doorway wall fell in the
+        wall's margin, was moved to the robot's side, and the plan flipped between "through the doorway"
+        and "straight at the wall" as their tracked spot moved."""
         s, g = self.cell(start), self.cell(goal)
-        if not (0 <= s[0] < self.n and 0 <= s[1] < self.n and 0 <= g[0] < self.n and 0 <= g[1] < self.n):
+        t = self.cell(target) if target is not None else g
+        if not all(0 <= c[0] < self.n and 0 <= c[1] < self.n for c in (s, g, t)):
             return None
         b = int(border_m / self.res)
-        x0, x1 = max(0, min(s[0], g[0]) - b), min(self.n, max(s[0], g[0]) + b + 1)
-        y0, y1 = max(0, min(s[1], g[1]) - b), min(self.n, max(s[1], g[1]) + b + 1)
+        x0, x1 = max(0, min(s[0], g[0], t[0]) - b), min(self.n, max(s[0], g[0], t[0]) + b + 1)
+        y0, y1 = max(0, min(s[1], g[1], t[1]) - b), min(self.n, max(s[1], g[1], t[1]) + b + 1)
         with self._lock:
             occ = self.occupied()[x0:x1, y0:y1]
             unknown = (np.abs(self.lo[x0:x1, y0:y1]) < 0.3) & ~occ
         field = distance_field(occ, self.res, cap_m=radius_m + 0.6)
-        ls, lg = (s[0] - x0, s[1] - y0), (g[0] - x0, g[1] - y0)
+        ls, lg, lt = (s[0] - x0, s[1] - y0), (g[0] - x0, g[1] - y0), (t[0] - x0, t[1] - y0)
+        rb = 0.15 / self.res                                   # the target's own body: its last 0.15 m
+
+        def sees(a, b) -> bool:
+            """No occupied cell on the line a -> b, except within rb of b (the person's own body)."""
+            n = max(abs(b[0] - a[0]), abs(b[1] - a[1])) * 2 + 1
+            xs = np.rint(np.linspace(a[0], b[0], n)).astype(int)
+            ys = np.rint(np.linspace(a[1], b[1], n)).astype(int)
+            far = np.hypot(xs - b[0], ys - b[1]) > rb
+            return not bool(occ[xs[far], ys[far]].any())
         penalty = np.clip((radius_m + 0.4 - field) / 0.4, 0.0, 1.0) * 2.0 + unknown * 0.3
         for margin in (margin_m, 0.03):
             self.last_margin = margin
             free = field >= radius_m + margin
-            if not free[ls]:                                   # starting in the margin: may leave it
-                free |= field >= max(0.0, field[ls] - 1e-3)
+            strict = free.copy()                               # where it may END: never the relaxed area below
+            if not free[ls]:                                   # starting in the margin: may leave it, but only
+                ii, jj = np.ogrid[:free.shape[0], :free.shape[1]]   # near the start: relaxed everywhere, the path's
+                near = np.hypot(ii - ls[0], jj - ls[1]) <= 0.4 / self.res   # end hugged a wall too (Nov 19 sim)
+                free |= (field >= max(0.0, field[ls] - 1e-3)) & near
                 free[ls] = True
             goal_c = lg
-            if not free[goal_c]:                               # a person's spot is "occupied" by them
-                r = int(0.6 / self.res)
-                ii, jj = np.mgrid[max(0, lg[0] - r):min(free.shape[0], lg[0] + r + 1),
-                                  max(0, lg[1] - r):min(free.shape[1], lg[1] + r + 1)]
-                ok = free[ii, jj]
-                if not ok.any():
+            wrong_side = target is not None and not sees(lg, lt)
+            if not strict[goal_c] or wrong_side:               # a person's spot is "occupied" by them; or the goal
+                r = int(0.6 / self.res)                        # is across a wall from what it is for
+                cx, cy = lt if wrong_side else lg              # wrong side: look round the target instead
+                ii, jj = np.mgrid[max(0, cx - r):min(free.shape[0], cx + r + 1),
+                                  max(0, cy - r):min(free.shape[1], cy + r + 1)]
+                ok = strict[ii, jj]                            # a place to stop with the full margin round it: a goal
+                if not ok.any():                               # in the start's relaxed area (0.22 m off a wall) was one
+                    continue                                   # DWA could not reach (Nov 19 sim, doorway2)
+                d = np.where(ok, np.hypot(ii - lg[0], jj - lg[1]), np.inf)   # nearest to the asked goal...
+                goal_c = None
+                for k in np.argsort(d, axis=None)[:int(np.isfinite(d).sum())]:
+                    c = np.unravel_index(k, d.shape)
+                    cand = (int(ii[c]), int(jj[c]))
+                    if target is None or sees(cand, lt):       # ...that can see the target
+                        goal_c = cand
+                        break
+                if goal_c is None:
                     continue
-                d = np.where(ok, np.hypot(ii - lg[0], jj - lg[1]), np.inf)
-                k = np.unravel_index(np.argmin(d), d.shape)
-                goal_c = (int(ii[k]), int(jj[k]))
             cells = theta_star(free, ls, goal_c, penalty)
             if cells:
                 path = [start] + [self.centre((c[0] + x0, c[1] + y0)) for c in cells[1:]]

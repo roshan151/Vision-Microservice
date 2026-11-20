@@ -1,0 +1,29 @@
+# Vision-And-Planning: everything the service imports, pinned to the versions running in .venv on
+# the Mac mini (macOS arm64, Python 3.12) as of 2026-11-19. The ranges it needs are in
+# pyproject.toml; this file is the known-good set.
+#
+#   .venv/bin/python -m pip install -r requirements.txt      (make install does this too)
+#
+# Not here: ORB-SLAM3 (visual SLAM) is a native build, see deploy/install_orbslam3_macos.sh.
+
+# API
+fastapi==0.141.1
+starlette==1.7.0
+pydantic==2.13.5
+uvicorn[standard]==0.54.0
+python-multipart==0.0.32
+pillow==12.3.0
+numpy==2.5.3
+
+# models: detection (YOLO), faces, depth, the VLM; OpenCV for the nav map's distance field
+torch==2.14.0
+torchvision==0.29.0
+ultralytics==8.4.165          # AGPL-3.0, see README "Licensing"
+insightface==2.0              # pretrained packs are research / non-commercial
+onnxruntime==1.30.0
+transformers==5.17.0
+opencv-python==5.0.0.93
+
+# tests
+pytest==9.1.1
+httpx==0.28.1

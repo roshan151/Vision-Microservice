@@ -236,6 +236,99 @@ def parse_pose(entry) -> Optional[tuple]:
     return t, R, p
 
 
+class PyMonoVO:
+    """Monocular Visual Odometry fallback using OpenCV feature tracking and Essential Matrix recovery.
+    Runs in-process without native ORB-SLAM3 / Cocoa viewer dependencies."""
+
+    def __init__(self, hfov_deg: float = 80.0, max_features: int = 800) -> None:
+        self.hfov = hfov_deg
+        self.max_features = max_features
+        self._prev_img: Optional[np.ndarray] = None
+        self._prev_pts: Optional[np.ndarray] = None
+        self._trajectory: list = []                       # (t, 3x4 pose matrix)
+        self._mappoints: list = []
+        self._R_wc = np.eye(3)                            # current camera orientation in world
+        self._p_wc = np.zeros(3)                          # current camera position in world
+        self._K: Optional[np.ndarray] = None
+        self._tracking = False
+
+    def _init_K(self, w: int, h: int) -> None:
+        fx = (w / 2.0) / math.tan(math.radians(self.hfov / 2.0))
+        self._K = np.array([
+            [fx, 0.0, w / 2.0],
+            [0.0, fx, h / 2.0],
+            [0.0, 0.0, 1.0],
+        ], dtype=np.float64)
+
+    def process_image_mono(self, img: np.ndarray, t: float) -> None:
+        import cv2
+        if self._K is None:
+            self._init_K(img.shape[1], img.shape[0])
+
+        if self._prev_img is None:
+            self._prev_img = img
+            self._prev_pts = cv2.goodFeaturesToTrack(img, maxCorners=self.max_features, qualityLevel=0.01, minDistance=10)
+            pose_3x4 = np.hstack([self._R_wc, self._p_wc.reshape(3, 1)])
+            self._trajectory.append((t, pose_3x4))
+            self._tracking = True
+            return
+
+        if self._prev_pts is None or len(self._prev_pts) < 15:
+            self._prev_pts = cv2.goodFeaturesToTrack(self._prev_img, maxCorners=self.max_features, qualityLevel=0.01, minDistance=10)
+            if self._prev_pts is None or len(self._prev_pts) < 8:
+                self._prev_img = img
+                self._tracking = False
+                pose_3x4 = np.hstack([self._R_wc, self._p_wc.reshape(3, 1)])
+                self._trajectory.append((t, pose_3x4))
+                return
+
+        curr_pts, status, _ = cv2.calcOpticalFlowPyrLK(
+            self._prev_img, img, self._prev_pts, None,
+            winSize=(21, 21), maxLevel=3,
+            criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01),
+        )
+
+        valid = status.flatten() == 1 if status is not None else np.zeros(len(self._prev_pts), dtype=bool)
+        p0 = self._prev_pts[valid]
+        p1 = curr_pts[valid] if curr_pts is not None else None
+
+        if p1 is not None and len(p0) >= 12:
+            E, mask = cv2.findEssentialMat(p1, p0, self._K, method=cv2.RANSAC, prob=0.999, threshold=1.0)
+            if E is not None and E.shape == (3, 3):
+                _, R_rel, t_rel, mask_pose = cv2.recoverPose(E, p1, p0, self._K, mask=mask)
+                disp = 0.04
+                self._R_wc = self._R_wc @ R_rel.T
+                self._p_wc = self._p_wc + self._R_wc @ (-R_rel.T @ t_rel.flatten() * disp)
+                self._tracking = True
+            else:
+                self._tracking = False
+        else:
+            self._tracking = False
+
+        pose_3x4 = np.hstack([self._R_wc, self._p_wc.reshape(3, 1)])
+        self._trajectory.append((t, pose_3x4))
+        if len(self._trajectory) > 1000:
+            self._trajectory = self._trajectory[-1000:]
+
+        if p1 is not None and len(p1) > 25:
+            self._prev_pts = p1.reshape(-1, 1, 2)
+        else:
+            self._prev_pts = cv2.goodFeaturesToTrack(img, maxCorners=self.max_features, qualityLevel=0.01, minDistance=10)
+        self._prev_img = img
+
+    def get_tracking_state(self) -> int:
+        return 2 if self._tracking else 0
+
+    def get_trajectory_points(self) -> list:
+        return self._trajectory
+
+    def get_tracked_mappoints(self) -> list:
+        return self._mappoints
+
+    def shutdown(self) -> None:
+        pass
+
+
 class MonoVSLAM:
     def __init__(self, vocab: Optional[str], hfov_deg: float = 80.0, mount=(0.05, -0.0275, 0.22),
                  work_dir: Optional[Path] = None, enabled: bool = True) -> None:
@@ -262,17 +355,15 @@ class MonoVSLAM:
         if not enabled:
             self.reason = "disabled (VS_VSLAM=0)"
             return
-        # Only look for it here: loading it into this process (beside torch and the venv's OpenCV) aborts
-        # the service on a second OpenMP runtime. It runs in a process of its own (_OrbProcess).
         import importlib.util
-        if importlib.util.find_spec("orbslam3") is None:
-            self.reason = "orbslam3 not installed: run deploy/install_orbslam3_macos.sh"
-            return
-        if not vocab or not os.path.exists(vocab):
-            self.reason = f"ORB vocabulary not found at {vocab!r} (VS_ORB_VOCAB)"
-            return
-        self.vocab = vocab
-        self.backend = "orbslam3"
+        has_orb = importlib.util.find_spec("orbslam3") is not None
+        has_vocab = bool(vocab and os.path.exists(vocab))
+        if has_orb and has_vocab:
+            self.vocab = vocab
+            self.backend = "orbslam3"
+        else:
+            self.backend = "pyvo"
+            self.reason = "using PyMonoVO fallback"
         threading.Thread(target=self._work, name="vslam", daemon=True).start()
 
     # ---------------------------------------------------------------- input
@@ -311,24 +402,46 @@ class MonoVSLAM:
                 self._track(*item)
             except Exception as exc:                       # noqa: BLE001
                 log.warning("vslam: %s: %s", type(exc).__name__, exc)
-                if "process exited" in str(exc) or "did not start" in str(exc):   # gone: carry on without it
-                    self.backend, self.reason, self.tracking = "none", f"ORB-SLAM3 stopped: {exc}", False
+                if self.backend == "orbslam3" and ("process exited" in str(exc) or "did not start" in str(exc)):
+                    log.info("vslam: falling back to PyMonoVO")
+                    self.backend = "pyvo"
+                    self.reason = f"ORB-SLAM3 stopped: {exc}; using PyMonoVO fallback"
+                    self._sys = PyMonoVO(self.hfov)
+                    self.record("slam_fallback", reason=str(exc))
+                    continue
+                elif self.backend != "orbslam3":
+                    continue
+                else:
+                    self.backend, self.reason, self.tracking = "none", f"SLAM stopped: {exc}", False
                     self.record("slam_stopped", reason=str(exc))
                     return
 
     def _start(self, w: int, h: int) -> None:
-        self.work_dir.mkdir(parents=True, exist_ok=True)
-        cfg = settings_yaml(self.work_dir / "camera.yaml", w, h, self.hfov)
-        if os.environ.get("VS_VSLAM_INPROC") == "1":       # tests (a stand-in module): in this process
-            import orbslam3
-            sys_ = orbslam3.System(self.vocab, str(cfg), orbslam3.Sensor.MONOCULAR)
-            if hasattr(sys_, "set_use_viewer"):
-                sys_.set_use_viewer(False)
-            sys_.initialize()
-        else:
-            sys_ = _OrbProcess(self.vocab, str(cfg))
-        self._sys = sys_
-        log.info("vslam: ORB-SLAM3 monocular started (%dx%d, hfov %.0f)", w, h, self.hfov)
+        if self.backend == "orbslam3":
+            self.work_dir.mkdir(parents=True, exist_ok=True)
+            cfg = settings_yaml(self.work_dir / "camera.yaml", w, h, self.hfov)
+            try:
+                if os.environ.get("VS_VSLAM_INPROC") == "1":
+                    import orbslam3
+                    try:
+                        sys_ = orbslam3.System(self.vocab, str(cfg), orbslam3.Sensor.MONOCULAR, False)
+                    except TypeError:
+                        sys_ = orbslam3.System(self.vocab, str(cfg), orbslam3.Sensor.MONOCULAR)
+                        if hasattr(sys_, "set_use_viewer"):
+                            sys_.set_use_viewer(False)
+                    sys_.initialize()
+                else:
+                    sys_ = _OrbProcess(self.vocab, str(cfg))
+                self._sys = sys_
+                log.info("vslam: ORB-SLAM3 monocular started (%dx%d, hfov %.0f)", w, h, self.hfov)
+            except Exception as exc:
+                log.warning("vslam: ORB-SLAM3 start failed (%s); falling back to PyMonoVO", exc)
+                self.backend = "pyvo"
+                self.reason = f"ORB-SLAM3 start failed: {exc}; using PyMonoVO fallback"
+                self._sys = PyMonoVO(self.hfov)
+        elif self.backend == "pyvo":
+            self._sys = PyMonoVO(self.hfov)
+            log.info("vslam: PyMonoVO monocular started (%dx%d, hfov %.0f)", w, h, self.hfov)
 
     def _track(self, jpeg: bytes, t: float, odom, pan: float, tilt: float, tof: Optional[dict] = None) -> None:
         from PIL import Image
@@ -467,12 +580,20 @@ def _plain(v):
 
 def _orb_child(conn, vocab: str, cfg: str) -> None:
     """The ORB-SLAM3 process: builds the System, then answers calls on it until told to stop."""
-    import orbslam3
-    sys_ = orbslam3.System(vocab, cfg, orbslam3.Sensor.MONOCULAR)
-    if hasattr(sys_, "set_use_viewer"):
-        sys_.set_use_viewer(False)
-    sys_.initialize()
-    conn.send(("ready", None))
+    try:
+        import orbslam3
+        try:
+            sys_ = orbslam3.System(vocab, cfg, orbslam3.Sensor.MONOCULAR, False)
+        except TypeError:
+            sys_ = orbslam3.System(vocab, cfg, orbslam3.Sensor.MONOCULAR)
+            if hasattr(sys_, "set_use_viewer"):
+                sys_.set_use_viewer(False)
+        sys_.initialize()
+        conn.send(("ready", None))
+    except Exception as exc:                               # noqa: BLE001
+        import traceback
+        conn.send(("err", f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}"))
+        return
     while True:
         name, args = conn.recv()
         if name == "shutdown":
@@ -502,8 +623,18 @@ class _OrbProcess:
         end = time.monotonic() + timeout_s                 # the vocabulary takes a few seconds to load
         while not self._conn.poll(0.2):
             if not self._proc.is_alive() or time.monotonic() > end:
+                try:
+                    self._proc.kill()
+                except Exception:
+                    pass
                 raise RuntimeError(f"ORB-SLAM3 process did not start (exit code {self._proc.exitcode})")
-        self._conn.recv()
+        kind, value = self._conn.recv()
+        if kind == "err":
+            try:
+                self._proc.kill()
+            except Exception:
+                pass
+            raise RuntimeError(f"ORB-SLAM3 initialization failed: {value}")
 
     def _call(self, name: str, *args):
         with self._lock:

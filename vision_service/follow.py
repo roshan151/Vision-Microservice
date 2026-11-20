@@ -28,6 +28,11 @@ does what the answer says. One follower at a time, like the SLAM session.
             whose range is further from where the target should be than range_tol_m
             (plus range_tol_grow_m per missed frame) is not taken by their clothes
             (a lookalike across the room). A face match is never overruled.
+            A range is refused (`_refuse`) when zones land on the floor (skipped), when it is
+            nearer than where their feet are by max(feet_margin_m, 3 sigma) (a chair leg or door
+            frame in front of them), or under min_person_range_m on a box that is not tall and
+            cut off at the top. `range_note` in the answer says why; every step's working goes to
+            debug/<session>/nav/follow.jsonl while the robot's debug_mode is on (nav_record.py).
     plan    bearing from the box centre; distance from the ToF zones on the box, else
             from the TF-Luna when its beam
             (the image centre column) lands on the box, otherwise from the box's
@@ -73,7 +78,10 @@ from dataclasses import dataclass
 from typing import Optional, Sequence
 
 import numpy as np
-from PIL import Image
+try:
+    from PIL import Image
+except ImportError:
+    Image = None
 
 from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
 from pydantic import BaseModel
@@ -81,7 +89,12 @@ from pydantic import BaseModel
 from . import images
 from .backends.base import Detection
 from .nav_api import project_detections
+from .nav_record import NavRecorder
 from .settings import settings
+
+# What follow computed, per step, into the robot's live debug session (debug/<session>/nav/follow.jsonl):
+# nothing while the robot's debug_mode is off. See nav_record.py.
+record = NavRecorder(jsonl="follow.jsonl")
 
 
 @dataclass
@@ -111,11 +124,14 @@ class FollowConfig:
     min_person_range_m: float = 0.4  # nearer than this, a person fills most of the frame
     range_tol_m: float = 1.2         # ToF range this far from where the target should be: not them by clothes
     range_tol_grow_m: float = 0.5    # ...plus this per missed frame (they walk on while lost)
+    floor_zone_m: float = 0.08       # a ToF zone landing this low (above the floor) is the floor, not them
+    feet_margin_m: float = 0.3       # a range this much nearer than where their feet are is something in front
 
 
 # Head sweep while searching: (pan_deg, tilt_up_deg). + pan is LEFT.
 # 45-degree steps: the camera sees 80 degrees, so neighbouring looks still overlap.
 SEARCH_SWEEP = [(45, 0), (90, 0), (90, 30), (0, 30), (-90, 30), (-90, 0), (-45, 0), (0, 0)]
+SWEEP_DWELL_S = 0.8              # each head position is held this long: the head gets there and looks
 
 
 @dataclass
@@ -127,16 +143,29 @@ class Geometry:
     range_m: Optional[float] = None   # TF-Luna along the camera axis
     tof_grid: Optional[list] = None   # 8x8 ToF ranges (m, None = no return), row 0 the top, as the camera sees
     tof_fov_deg: float = 60.0         # the ToF's square field of view
+    tof_pan_offset_deg: float = 0.0   # ToF pan offset relative to camera (+ is left)
+    tof_tilt_offset_deg: float = 0.0  # ToF tilt offset relative to camera (+ is up)
     hint_deg: Optional[float] = None  # where they were last seen, from the robot's heading now (+ left)
 
 
-def range_in_box(grid, box, W: int, H: int, hfov_deg: float, tof_fov_deg: float = 60.0) -> Optional[float]:
+def range_in_box(grid, box, W: int, H: int, hfov_deg: float, tof_fov_deg: float = 60.0,
+                 tof_pan_offset_deg: float = 0.0, tof_tilt_offset_deg: float = 0.0,
+                 tilt_deg: Optional[float] = None, height_m: Optional[float] = None,
+                 floor_m: float = 0.08, info: Optional[dict] = None) -> Optional[float]:
     """Median range of the ToF zones whose centres fall in a camera box; a box too small
     for any centre takes the nearest zone it touches (it stands in front of what is
     behind it). The ToF sits beside the camera and looks the same way. Same rule as the
-    Pi's robot_core.sensors.tof8x8.range_in_box. None if no zone on it has a range."""
+    Pi's robot_core.sensors.tof8x8.range_in_box. None if no zone on it has a range.
+
+    With the head's real tilt and the sensor's height, a zone whose point lands within floor_m
+    of the floor is skipped: the floor in front of their feet is nearer than they are, and the
+    near-third percentile took it (Nov 19). `info`, if given, gets the zone counts."""
     if not grid or box is None:
         return None
+    if tof_pan_offset_deg is None:
+        tof_pan_offset_deg = 0.0
+    if tof_tilt_offset_deg is None:
+        tof_tilt_offset_deg = 0.0
     n = len(grid)
     zone = tof_fov_deg / n
     f = (W / 2.0) / math.tan(math.radians(hfov_deg) / 2.0)
@@ -144,17 +173,24 @@ def range_in_box(grid, box, W: int, H: int, hfov_deg: float, tof_fov_deg: float 
     right = math.degrees(math.atan2(W / 2.0 - box[2], f))
     top = math.degrees(math.atan2(H / 2.0 - box[1], f))
     bottom = math.degrees(math.atan2(H / 2.0 - box[3], f))
-    good, touched, half, mid = [], [], zone / 2.0, (n - 1) / 2.0
+    good, touched, half, mid, floor = [], [], zone / 2.0, (n - 1) / 2.0, 0
     for r in range(n):
         for c in range(len(grid[r])):
             v = grid[r][c]
             if v is None:
                 continue
-            up, lf = (mid - r) * zone, (mid - c) * zone
+            up = (mid - r) * zone + tof_tilt_offset_deg
+            lf = (mid - c) * zone + tof_pan_offset_deg
+            if tilt_deg is not None and height_m and right - half < lf < left + half \
+                    and bottom - half < up < top + half and height_m + v * math.sin(math.radians(tilt_deg + up)) < floor_m:
+                floor += 1
+                continue
             if right <= lf <= left and bottom <= up <= top:
                 good.append(v)
             elif right - half < lf < left + half and bottom - half < up < top + half:
                 touched.append(v)
+    if info is not None:
+        info.update(good=len(good), touched=len(touched), floor=floor)
     if good:   # the near third: zones between legs see the wall behind (Nov 19: 1 m flipped to 2.4 m)
         return float(np.percentile(good, 30))
     return min(touched) if touched else None
@@ -167,6 +203,7 @@ def _hist(rgb: np.ndarray, x1: float, y1: float, x2: float, y2: float) -> Option
     crop = rgb[int(y1):int(y2), int(x1):int(x2)]
     if crop.size < 3 * 16:
         return None
+    from PIL import Image
     hsv = np.asarray(Image.fromarray(np.ascontiguousarray(crop)).convert("HSV")).reshape(-1, 3)
     hist, _ = np.histogramdd(hsv, bins=(8, 4, 4), range=((0, 256),) * 3)
     hist = hist.ravel()
@@ -209,6 +246,7 @@ class FollowSession:
         self.active = True
         self.bank: list[np.ndarray] = []          # clothes looks; [0] is the one seen with the face at lock
         self.confirm, self.misses, self.sweep = 0, 0, 0
+        self.sweep_t = 0.0                        # when the head was sent to its present search position
         self.last_bearing = 0.0
         self.expect: Optional[float] = None       # bearing they should be at in the next frame
         self.expect_dist: Optional[float] = None  # their ToF distance next frame (after the drive)
@@ -217,6 +255,8 @@ class FollowSession:
         self.lost_t: Optional[float] = None       # when they were last lost (first miss)
         self.followed = False                     # locked at least once
         self._candidate: Optional[str] = None     # "follow me": who is being confirmed
+        self._why: Optional[str] = None           # how _pick chose (for the debug record)
+        self._range_note: Optional[str] = None    # why a ToF/range reading was not used for the distance
 
     def stop(self) -> None:
         self.active = False
@@ -265,13 +305,21 @@ class FollowSession:
         f = (W / 2.0) / math.tan(math.radians(geo.hfov_deg) / 2.0)
         bearings = [geo.pan_deg + math.degrees(math.atan2(W / 2.0 - (p.bbox[0] + p.bbox[2]) / 2.0, f))
                     for p in persons]
-        ranges = [range_in_box(geo.tof_grid, p.bbox, W, H, geo.hfov_deg, geo.tof_fov_deg) for p in persons]
-        # A range this near on a box that does not fill the frame is not them: the zones caught a
-        # wall or door jamb beside them (Nov 18: "tracking Roshan at 0.14 m", facing a wall).
-        ranges = [None if r is None or not 0.1 < r <= cfg.max_range_m
-                  or (r < cfg.min_person_range_m and p.bbox[3] - p.bbox[1] < 0.7 * H)
-                  else r * math.cos(math.radians(geo.tilt_deg)) for r, p in zip(ranges, persons)]
+        self._why = self._range_note = None
+        info = [{} for _ in persons]
+        raw = [range_in_box(geo.tof_grid, p.bbox, W, H, geo.hfov_deg, geo.tof_fov_deg,
+                            geo.tof_pan_offset_deg, geo.tof_tilt_offset_deg,
+                            tilt_deg=geo.tilt_deg, height_m=geo.camera_height_m,
+                            floor_m=cfg.floor_zone_m, info=inf) for p, inf in zip(persons, info)]
+        ranges = []
+        for r, p, inf in zip(raw, persons, info):
+            inf["tof_raw"], inf["feet_m"] = r, self._feet(p.bbox, H, f, geo)
+            inf["tof_why"] = None if r is None else self._refuse(r, p.bbox, H, geo, inf["feet_m"],
+                                                                 edge_only=not inf.get("good"))
+            ranges.append(None if r is None or inf["tof_why"] else r * math.cos(math.radians(geo.tilt_deg)))
         pick = self._pick(rgb, persons, face_labels, bearings, ranges)
+        self._dbg = {"info": info, "bearings": bearings, "faces": list(face_labels), "pick": pick,
+                     "boxes": [p.bbox for p in persons]}
 
         if pick is None:
             self.misses += 1
@@ -289,9 +337,14 @@ class FollowSession:
                 turn = self._start_search(geo.hint_deg)
                 if turn:
                     return self._out("searching", geo, turn_deg=turn)
-            if self.sweep >= len(self.path):
-                return self._out("gone", geo)
-            self.sweep += 1                               # next head position
+            # One position per SWEEP_DWELL_S, round again until search_s: a step per frame ran the whole
+            # sweep in under a second and gave up ("gone" ended the follow) before the Pi had gone to
+            # where they were last seen (Nov 19).
+            now = self.clock()
+            if self.sweep and now - self.sweep_t < SWEEP_DWELL_S:
+                return self._out("searching", geo)
+            self.sweep_t = now
+            self.sweep = self.sweep % len(self.path) + 1  # next head position
             return self._out("searching", geo)
 
         if not self.locked:          # still confirming who it is: don't move yet
@@ -304,6 +357,9 @@ class FollowSession:
         self.last_bearing = bearing
         dist, how = self._distance(box, W, H, f, geo, face_px[pick] if pick < len(face_px) else None,
                                    ranges[pick])
+        if info[pick].get("tof_why"):                   # the ToF on them was refused: say why, for the Pi's log
+            note = f"ToF {info[pick]['tof_raw']:.2f} m: {info[pick]['tof_why']}"
+            self._range_note = note + (f"; {self._range_note}" if self._range_note else "")
 
         turn = -bearing * cfg.turn_gain if abs(bearing) > cfg.turn_deadband_deg else 0.0
         drive = 0.0
@@ -318,14 +374,47 @@ class FollowSession:
         return self._out("tracking", geo, box=box, bearing=bearing, dist=dist, how=how,
                          turn_deg=turn, drive_m=drive, confidence=conf)
 
+    def _feet(self, box, H: int, f: float, geo: Geometry) -> Optional[float]:
+        """How far their feet are, from the box's bottom edge on the floor plane; None when the
+        box is cut off at the bottom of the frame (no feet in view) or the edge is above the horizon."""
+        if box[3] >= H * (1.0 - self.cfg.bottom_margin):
+            return None
+        below = math.radians(-geo.tilt_deg) + math.atan2(box[3] - H / 2.0, f)
+        return geo.camera_height_m / math.tan(below) if below > math.radians(1.0) else None
+
+    def _refuse(self, r: float, box, H: int, geo: Geometry, feet: Optional[float],
+                edge_only: bool = False) -> Optional[str]:
+        """Why a range read on this box is not their distance, or None (it is). edge_only: no zone
+        centre fell inside the box (a narrow, far person), so the range is the nearest zone merely
+        touching it, which beside a door frame is the frame."""
+        cfg = self.cfg
+        if not 0.1 < r <= cfg.max_range_m:
+            return "out of range"
+        # Nearer than min_person_range_m they fill the frame (cut off at the top) and the box is
+        # tall; otherwise the zones caught a wall or door jamb beside them (Nov 18: "tracking
+        # Roshan at 0.14 m", facing a wall).
+        if r < cfg.min_person_range_m and (box[3] - box[1] < 0.7 * H or box[1] > H * cfg.bottom_margin):
+            return "too near for the box"
+        d = r * math.cos(math.radians(geo.tilt_deg))
+        if edge_only and feet is not None and d < feet - cfg.feet_margin_m:
+            # Nov 19: framed in a doorway 2-4 m away, the zones touching their box read the frame at
+            # 0.9-1.4 m; the person was placed at the door, nav stood "the way round is long", and they
+            # walked on into the next room. The far-feet sigma no longer excuses an edge-only range.
+            return f"edge zones only, nearer than their feet ({feet:.2f} m)"
+        if feet is not None and d < feet - max(cfg.feet_margin_m, 3.0 * self._sigma(feet, "floor", geo)):
+            # Something between the robot and them (a chair leg, a door frame): Nov 19, 0.22 m by ToF
+            # while their feet were 0.8 m out, and the Pi stopped short and lost them.
+            return f"nearer than their feet ({feet:.2f} m)"
+        return None
+
     def _start_search(self, hint: Optional[float]) -> float:
         """Order this search's head positions: where they were last seen first. Further
-        round than the head can look: turn the robot that way instead (the turn, + right)."""
+        round than the head can comfortably track: turn the robot that way instead (the turn, + right)."""
         self.path = SEARCH_SWEEP
         if hint is None or abs(hint) < 10.0 or self.hinted:
             return 0.0
         self.hinted = True                        # once per loss: after a turn the hint is stale
-        if abs(hint) > 90.0:
+        if abs(hint) > 35.0:
             return -max(-180.0, min(180.0, hint))
         self.path = [(int(round(hint)), 0)] + SEARCH_SWEEP
         return 0.0
@@ -338,7 +427,9 @@ class FollowSession:
                 sig = signature(rgb, persons[i].bbox)
                 if self.locked:
                     self.learn(sig)
+                    self._why = "face"
                     return i
+                self._why = "face, confirming"
                 self.confirm += 1
                 self._candidate = label
                 if self.confirm >= cfg.confirm_frames and sig is not None:
@@ -369,6 +460,7 @@ class FollowSession:
             if len(near) == 1 and near[0][2] >= cfg.continuity_similarity:
                 i, sig, _, _ = near[0]                   # alone where expected: still them, learn the new look
                 self.learn(sig)
+                self._why = f"alone where expected (clothes {near[0][2]:.2f})"
                 return i
             ok = sorted(((sim + cfg.motion_weight * (1.0 - miss / gate), sim, i, sig)
                          for i, sig, sim, miss in near if sim >= cfg.min_similarity),
@@ -377,10 +469,13 @@ class FollowSession:
                 score, sim, i, sig = ok[0]
                 if sim >= cfg.learn_similarity and (len(ok) == 1 or score - ok[1][0] > cfg.ambiguity):
                     self.learn(sig)
+                self._why = f"best clothes near expected ({sim:.2f}, of {len(ok)})"
                 return i
         # 1b. Lost and searching: the only person in view, in clothes like theirs and without
         # someone else's face, is taken back (not learned).
-        elif len(persons) == 1 and cands and cands[0][2] >= cfg.continuity_similarity:
+        # Nov 19: at 0.43 a false box (slippers on the floor, nobody in view) was taken back as them.
+        elif len(persons) == 1 and cands and cands[0][2] >= cfg.min_similarity:
+            self._why = f"only person in view while searching (clothes {cands[0][2]:.2f})"
             return cands[0][0]
 
         # 2. Anywhere in view: only a strong clothes match, and nothing is learned.
@@ -394,6 +489,8 @@ class FollowSession:
             score = sim - 0.2 * abs((box[0] + box[2]) / 2.0 / W - 0.5)
             if score > best_score:
                 best, best_score = i, score
+        if best is not None:
+            self._why = f"strong clothes match anywhere ({best_score:.2f})"
         return best
 
     def _distance(self, box, W, H, f, geo: Geometry, face_px: Optional[float] = None,
@@ -406,7 +503,12 @@ class FollowSession:
             return tof, "tof"
         r = geo.range_m
         if r is not None and 0.1 < r <= cfg.max_range_m and box[0] <= W / 2.0 <= box[2]:
-            return r * math.cos(math.radians(geo.tilt_deg)), "range"
+            # The Pi reads range_m on the PREVIOUS frame's box: the same check as the ToF on this one.
+            why = self._refuse(r, box, H, geo, self._feet(box, H, f, geo))
+            if why is None:
+                return r * math.cos(math.radians(geo.tilt_deg)), "range"
+            self._range_note = f"Pi range {r:.2f} m: {why}"
+
         # A box ending at (or a few px short of) the bottom edge is cut off there: the
         # "feet" would be the frame edge, always the same distance whoever stands where.
         near = False
@@ -457,7 +559,22 @@ class FollowSession:
             "turn_deg": round(float(turn_deg), 1),
             "drive_m": round(float(drive_m), 2),
             "head": list(self.path[self.sweep - 1]) if self.sweep else [0, 0],
+            "range_note": self._range_note,       # why a ToF/range reading was passed over, or None
         }
+
+    def debug_record(self) -> dict:
+        """This step's working, for nav_record (follow.jsonl): every person and how the pick was made."""
+        d = getattr(self, "_dbg", None) or {}
+        persons = []
+        for i, box in enumerate(d.get("boxes", [])):
+            inf = d["info"][i] if i < len(d.get("info", [])) else {}
+            persons.append({"box": [round(float(v), 1) for v in box], "face": d["faces"][i] if i < len(d["faces"]) else None,
+                            "bearing": round(d["bearings"][i], 1), "tof": inf.get("tof_raw"),
+                            "zones": [inf.get("good"), inf.get("touched"), inf.get("floor")],
+                            "tof_why": inf.get("tof_why"), "feet_m": inf.get("feet_m")})
+        return {"persons": persons, "pick": d.get("pick"), "why": self._why, "misses": self.misses,
+                "sweep": self.sweep, "looks": len(self.bank), "expect_deg": self.expect,
+                "expect_dist": self.expect_dist}
 
 
 # --------------------------------------------------------------------------
@@ -483,6 +600,7 @@ async def follow_start(request: Request, body: FollowStartIn) -> dict:
     if (want and label is None) or not labels:
         raise HTTPException(status_code=404, detail=f"{body.label or 'nobody'!r} is not enrolled")
     st.follow.start(label)
+    record("follow_start", label=label, asked=body.label)
     return {"label": label, "state": "searching"}
 
 
@@ -498,6 +616,8 @@ async def follow_step(
     range_m: Optional[float] = Form(None, description="TF-Luna along the camera axis, if read"),
     tof_grid: Optional[str] = Form(None, description="JSON 8x8 ToF ranges in m (null = no return), row 0 the top"),
     tof_fov_deg: float = Form(60.0),
+    tof_pan_offset_deg: Optional[float] = Form(None, description="ToF pan offset relative to camera (+ left)"),
+    tof_tilt_offset_deg: Optional[float] = Form(None, description="ToF tilt offset relative to camera (+ up)"),
     hint_deg: Optional[float] = Form(None, description="where they were last seen, from the robot's heading (+ left)"),
     pose: Optional[str] = Form(None, description="JSON (x, y, heading): the robot's odometry pose when the frame was taken"),
 ) -> dict:
@@ -523,9 +643,27 @@ async def follow_step(
                      key=lambda d: (d.bbox[2] - d.bbox[0]) * (d.bbox[3] - d.bbox[1]),
                      reverse=True)[:MAX_PERSONS]
     faces = [await _face_label(st, rgb, p.bbox) for p in persons]
-    out = st.follow.step(rgb, persons, [label for label, _ in faces], Geometry(
-        pan_deg, tilt_deg, hfov_deg, camera_height_m, range_m, grid, tof_fov_deg, hint_deg),
-        face_px=[w for _, w in faces])
+    pan_offset = tof_pan_offset_deg if tof_pan_offset_deg is not None else getattr(settings, "tof_pan_offset_deg", 0.0)
+    tilt_offset = tof_tilt_offset_deg if tof_tilt_offset_deg is not None else getattr(settings, "tof_tilt_offset_deg", 0.0)
+    geo = Geometry(
+        pan_deg=pan_deg,
+        tilt_deg=tilt_deg,
+        hfov_deg=hfov_deg,
+        camera_height_m=camera_height_m,
+        range_m=range_m,
+        tof_grid=grid,
+        tof_fov_deg=tof_fov_deg,
+        tof_pan_offset_deg=pan_offset,
+        tof_tilt_offset_deg=tilt_offset,
+        hint_deg=hint_deg,
+    )
+    out = st.follow.step(rgb, persons, [label for label, _ in faces], geo,
+                         face_px=[w for _, w in faces])
+    record("follow_step", seq=seq, wh=[rgb.shape[1], rgb.shape[0]], hfov=hfov_deg, cam_h=camera_height_m,
+           pan=pan_deg, tilt=tilt_deg, hint=hint_deg, range_m=range_m,
+           pose=json.loads(pose) if pose else None, out={k: out[k] for k in (
+               "state", "target", "bbox", "bearing_deg", "distance_m", "distance_from", "distance_sigma_m",
+               "range_note", "turn_deg", "head")}, **st.follow.debug_record())
     return {"seq": seq, "persons": len(persons), **out}
 
 
@@ -533,6 +671,7 @@ async def follow_step(
 async def follow_stop(request: Request) -> dict:
     st = request.app.state
     st.follow.stop()
+    record("follow_stop", target=st.follow.target, followed=st.follow.followed)
     return {"target": st.follow.target, "followed": st.follow.followed}
 
 

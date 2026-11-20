@@ -39,8 +39,8 @@ router = APIRouter()
 # for (skateboard, sports ball, umbrella).
 OBSTACLES = {"chair", "couch", "bed", "dining table", "potted plant", "bench", "suitcase",
              "backpack", "handbag", "bicycle", "motorcycle", "vase"}
-SEMANTIC_MIN_CONF = 0.55         # a guess is not an obstacle
-SEMANTIC_MAX_M = 2.0             # floor projection gets poor beyond this: at 2-3 m a suitcase was put 0.4-0.6 m too far (Nov 19)
+SEMANTIC_MIN_CONF = 0.68         # a guess is not an obstacle; doorposts must not be mistaken for furniture
+SEMANTIC_MAX_M = 1.8             # floor projection gets poor beyond this
 
 
 class NavSession:
@@ -100,8 +100,9 @@ def project_detections(nav: Optional[NavSession], dets, W: int, H: int, pan_deg:
         width = (d.bbox[2] - d.bbox[0]) / f * dist
         r = dist + width / 4.0                              # the box's bottom edge is its near side
         xy = apply(to_map, [(r * math.cos(bearing), r * math.sin(bearing))])[0]
-        nav.map.add_semantic((float(xy[0]), float(xy[1])), max(0.12, min(0.6, width / 2.0)), d.cls)
-        nav.record("semantic", cls=d.cls, xy=[float(xy[0]), float(xy[1])], radius=max(0.12, min(0.6, width / 2.0)),
+        obs_r = max(0.10, min(0.35, width / 2.0))
+        nav.map.add_semantic((float(xy[0]), float(xy[1])), obs_r, d.cls)
+        nav.record("semantic", cls=d.cls, xy=[float(xy[0]), float(xy[1])], radius=obs_r,
                    dist=dist, bearing_deg=math.degrees(bearing), pose=list(pose), odom_to_map=list(nav.odom_to_map))
         n += 1
     return n
@@ -129,6 +130,7 @@ async def nav_frame(request: Request, image: UploadFile = File(...), t: float = 
 class PlanIn(BaseModel):
     pose: list                   # (x, y, heading) in the Pi's odometry frame
     goal: list                   # (x, y) in the same frame
+    target: Optional[list] = None  # (x, y): what the goal is for (the person): the goal stays on its side of walls
     radius_m: float = 0.19
     local: Optional[dict] = None  # RollingCostmap.snapshot()
 
@@ -143,13 +145,17 @@ async def nav_plan(request: Request, body: PlanIn) -> dict:
     start = compose(o2m, body.pose)
     nav.map.robot = start
     goal = apply(o2m, [body.goal[:2]])[0]
+    target = apply(o2m, [body.target[:2]])[0] if body.target else None
     path = await run_in_threadpool(nav.map.plan, (start[0], start[1]), (float(goal[0]), float(goal[1])),
-                                   body.radius_m)          # not the inference queue: planning is CPU only
+                                   body.radius_m, 0.05, 2.0,
+                                   None if target is None else (float(target[0]), float(target[1])))
+    # (not the inference queue: planning is CPU only)
     nav.last_plan_ms = (time.monotonic() - t0) * 1000.0
     nav.plans += 1
     map_file = nav.record.save_map(nav.map) if nav.record.map_due() else None
     nav.record("plan", pose=body.pose, goal=body.goal, radius_m=body.radius_m, odom_to_map=list(o2m),
                start_map=list(start), goal_map=[float(goal[0]), float(goal[1])], folded_cells=folded,
+               target=body.target, target_map=None if target is None else [float(target[0]), float(target[1])],
                path_map=path or [], path_odom=apply(inverse(o2m), path).tolist() if path else [],
                margin_m=getattr(nav.map, "last_margin", None), ms=nav.last_plan_ms, ok=bool(path),
                vslam_tracking=nav.vslam.tracking, map=map_file)
