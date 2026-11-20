@@ -132,6 +132,7 @@ class FollowConfig:
 # 45-degree steps: the camera sees 80 degrees, so neighbouring looks still overlap.
 SEARCH_SWEEP = [(45, 0), (90, 0), (90, 30), (0, 30), (-90, 30), (-90, 0), (-45, 0), (0, 0)]
 SWEEP_DWELL_S = 0.8              # each head position is held this long: the head gets there and looks
+PERSON_LOOK_S = 2.0              # someone in view (not yet them): the sweep waits this long per position for a face
 
 
 @dataclass
@@ -247,6 +248,7 @@ class FollowSession:
         self.bank: list[np.ndarray] = []          # clothes looks; [0] is the one seen with the face at lock
         self.confirm, self.misses, self.sweep = 0, 0, 0
         self.sweep_t = 0.0                        # when the head was sent to its present search position
+        self.view_t: Optional[float] = None       # since when someone (not picked) has been in view here
         self.last_bearing = 0.0
         self.expect: Optional[float] = None       # bearing they should be at in the next frame
         self.expect_dist: Optional[float] = None  # their ToF distance next frame (after the drive)
@@ -329,8 +331,15 @@ class FollowSession:
                 return self._out("gone", geo)             # lost too long: give up, the Pi ends the task
             if self.locked and self.misses <= cfg.hold_frames:
                 return self._out("holding", geo)
-            if persons:                                   # someone in view: stop sweeping, keep looking here
-                return self._out("searching", geo, box=persons[0].bbox)
+            if persons:                                   # someone in view: stop sweeping, look here for a while
+                # For PERSON_LOOK_S, not until a face shows: a face above the frame (box cut off at the top) never
+                # shows, and the head stared at a body for whole follows, never sweeping (Nov 19, 0 faces in 221
+                # steps). The sweep's tilted-up positions are what bring such a face into view.
+                self.view_t = self.view_t if self.view_t is not None else self.clock()
+                if self.clock() - self.view_t < PERSON_LOOK_S:
+                    return self._out("searching", geo, box=persons[0].bbox)
+            else:
+                self.view_t = None
             if not self.locked and self.misses % 2:      # two looks per heading before turning
                 return self._out("searching", geo)
             if self.sweep == 0:                           # a new search: start where they were last seen
@@ -343,7 +352,7 @@ class FollowSession:
             now = self.clock()
             if self.sweep and now - self.sweep_t < SWEEP_DWELL_S:
                 return self._out("searching", geo)
-            self.sweep_t = now
+            self.sweep_t, self.view_t = now, None
             self.sweep = self.sweep % len(self.path) + 1  # next head position
             return self._out("searching", geo)
 
