@@ -27,9 +27,11 @@ LOG_FILE       := $(LOG_DIR)/vision-and-planning.log
 HEALTH_URL     := http://127.0.0.1:$(VS_PORT)/healthz
 # First start after install downloads model weights; give it time.
 HEALTH_TIMEOUT ?= 180
+# ORB-SLAM3 loads its vocabulary after the service is up (vslam._OrbProcess gives it 300 s).
+VSLAM_TIMEOUT  ?= 330
 
 .PHONY: help install reinstall test run deploy start restart stop uninstall \
-        status health logs wait-healthy clean FORCE
+        status health logs wait-healthy wait-vslam clean FORCE
 
 help: ## Show this list
 	@grep -E '^[a-z-]+:.*## ' $(firstword $(MAKEFILE_LIST)) | \
@@ -119,6 +121,7 @@ start: $(STAMP) $(PLIST_DST) ## (Re)start the service in the background; it also
 	@if [[ -f $(LOG_FILE) ]]; then mv -f $(LOG_FILE) $(LOG_FILE).1; fi
 	launchctl bootstrap $(DOMAIN) $(PLIST_DST)
 	@$(MAKE) --no-print-directory wait-healthy
+	@$(MAKE) --no-print-directory wait-vslam
 
 restart: start ## Same as start
 
@@ -167,6 +170,23 @@ wait-healthy:
 	done; \
 	echo; echo "not healthy after $(HEALTH_TIMEOUT)s. Last lines of $(LOG_FILE):"; \
 	tail -n 40 $(LOG_FILE); exit 1
+
+# Fails `make start` (the service keeps running, on the PyMonoVO fallback) unless visual SLAM comes up as
+# ORB-SLAM3. VS_VSLAM=0 passes.
+wait-vslam: ## Wait for ORB-SLAM3 to load; fail if it fell back
+	@printf "waiting for ORB-SLAM3 "; \
+	for i in $$(seq 1 $(VSLAM_TIMEOUT)); do \
+	  v=$$(curl -fsS -m 2 $(HEALTH_URL) 2>/dev/null | $(PYTHON) -c 'import json, sys; s = json.load(sys.stdin).get("vslam") or {}; print(s.get("backend"), "ready" if s.get("ready") else "loading", s.get("reason") or "")' 2>/dev/null); \
+	  case "$$v" in \
+	    "orbslam3 ready"*) echo " ready after $${i}s"; exit 0;; \
+	    none*disabled*) echo " disabled (VS_VSLAM=0)"; exit 0;; \
+	    "orbslam3 loading"*|"") printf "."; sleep 1;; \
+	    *) echo; echo "ORB-SLAM3 FAILED: $$v"; break;; \
+	  esac; \
+	done; \
+	[[ "$$v" == "orbslam3 loading"* || -z "$$v" ]] && { echo; echo "ORB-SLAM3 FAILED: not ready after $(VSLAM_TIMEOUT)s"; }; \
+	echo "ORB-SLAM3 lines in $(LOG_FILE):"; \
+	grep -iE "vslam|orb|slam3|vocab" $(LOG_FILE) | tail -n 30; exit 1
 
 clean: ## Remove caches (keeps .venv)
 	find . -name __pycache__ -type d -prune -not -path './$(VENV)/*' -exec rm -rf {} +

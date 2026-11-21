@@ -95,9 +95,11 @@ class Settings:
     robot_radius_m: float = field(default_factory=lambda: _env_f("VS_ROBOT_RADIUS_M", 0.18))
     # --- global navigation (nav_api.py): Theta* + monocular visual SLAM -----
     # ORB-SLAM3's vocabulary (deploy/install_orbslam3_macos.sh puts it here); without it, or
-    # without the orbslam3 module, the global map runs on the Pi's odometry alone.
-    orb_vocab: str = field(default_factory=lambda: _env(
-        "VS_ORB_VOCAB", str(Path.home() / ".robot-vision" / "orbslam3" / "ORBvoc.txt")))
+    # without the orbslam3 module, the global map runs on the Pi's odometry alone. ORBvoc.bin
+    # (patched ORB-SLAM3) loads in about a second; ORBvoc.txt takes minutes on macOS.
+    orb_vocab: str = field(default_factory=lambda: _env("VS_ORB_VOCAB", str(next(
+        (p for p in (Path.home() / ".robot-vision" / "orbslam3" / n for n in ("ORBvoc.bin", "ORBvoc.txt")) if p.exists()),
+        Path.home() / ".robot-vision" / "orbslam3" / "ORBvoc.txt"))))
     vslam_enabled: bool = field(default_factory=lambda: _env("VS_VSLAM", "1") not in ("0", "false", "no"))
     camera_hfov_deg: float = field(default_factory=lambda: _env_f("VS_CAMERA_HFOV_DEG", 80.0))   # robot.yaml hfov_deg
     head_x_m: float = field(default_factory=lambda: _env_f("VS_HEAD_X_M", 0.0))         # robot.yaml pan_axis_x_m (gimbal at the centre)

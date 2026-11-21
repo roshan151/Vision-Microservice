@@ -319,6 +319,8 @@ class FollowSession:
             inf["tof_why"] = None if r is None else self._refuse(r, p.bbox, H, geo, inf["feet_m"],
                                                                  edge_only=not inf.get("good"))
             ranges.append(None if r is None or inf["tof_why"] else r * math.cos(math.radians(geo.tilt_deg)))
+        if geo.hint_deg is not None and self.expect is not None:
+            self.expect = geo.hint_deg                    # the Pi's odometry: where they were, after its real turn
         pick = self._pick(rgb, persons, face_labels, bearings, ranges)
         self._dbg = {"info": info, "bearings": bearings, "faces": list(face_labels), "pick": pick,
                      "boxes": [p.bbox for p in persons]}
@@ -375,8 +377,10 @@ class FollowSession:
         if dist is not None and how != "near" and abs(bearing) <= cfg.drive_max_bearing_deg \
                 and dist > cfg.standoff_m + 0.1:
             drive = min(dist - cfg.standoff_m, cfg.max_step_m)
-        # Turning right by `turn` moves every bearing left (+) by as much.
-        self.expect = bearing + turn
+        # Not bearing + turn: the Pi steers by velocity and does not drive turn_deg while tracking (Nov 20: the
+        # target at 60 deg was expected at 24, and a second person seated at -18 was taken as them). Its hint corrects for
+        # how far it really turned.
+        self.expect = bearing
         self.expect_dist = dist - drive if how == "tof" else None
         conf = 1.0 if face_labels[pick] == self.target and self.target else \
             (lambda sig: 0.0 if sig is None else self.similarity(sig))(signature(rgb, box))
@@ -468,7 +472,8 @@ class FollowSession:
                     if abs(bearings[i] - self.expect) <= gate]
             if len(near) == 1 and near[0][2] >= cfg.continuity_similarity:
                 i, sig, _, _ = near[0]                   # alone where expected: still them, learn the new look
-                self.learn(sig)
+                if near[0][2] >= cfg.learn_similarity:   # a weak match is kept, not learned: learned at 0.40,
+                    self.learn(sig)                      # the other person's look then matched 0.6-0.8 (Nov 20)
                 self._why = f"alone where expected (clothes {near[0][2]:.2f})"
                 return i
             ok = sorted(((sim + cfg.motion_weight * (1.0 - miss / gate), sim, i, sig)

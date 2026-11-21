@@ -9,9 +9,10 @@
 # What it does, each step stopping the script if it fails:
 #   1. Homebrew dependencies (cmake, eigen, opencv, boost, glew, openssl)
 #   2. Pangolin (ORB-SLAM3's viewer library; built from source, the viewer stays off)
-#   3. ORB-SLAM3 itself (hello-binit's fork, the one the bindings are written against), with its
+#   3. ORB-SLAM3 itself (hello-binit's fork, the one the bindings are written against, patched to load
+#      a binary vocabulary: deploy/orbslam3_binary_vocabulary.patch), with its
 #      bundled DBoW2 and g2o, laid out under the prefix the way the bindings look for it
-#   4. the ORB vocabulary (ORBvoc.txt), where VS_ORB_VOCAB expects it
+#   4. the ORB vocabulary: ORBvoc.txt, converted to ORBvoc.bin (where VS_ORB_VOCAB expects it)
 #   5. Boost.Python built for the service's own Python (Homebrew's boost-python3 is built for
 #      Homebrew's newest Python, 3.15 as of Nov 2026; the service runs Anaconda's 3.12)
 #   6. the Python bindings (ORB_SLAM3-PythonBindings, written for Python 3.10 on Ubuntu: patched for
@@ -94,6 +95,11 @@ sed -i '' -e 's#lib/libDBoW2\.so#lib/libDBoW2${CMAKE_SHARED_LIBRARY_SUFFIX}#g' \
 sed -i '' 's/std::pair<const KeyFrame\*, *g2o::Sim3>/std::pair<KeyFrame* const, g2o::Sim3>/g' include/LoopClosing.h
 # They ask for OpenCV "3.0" / "4.4"; OpenCV only counts the same major version as a match, so ask for any
 sed -i '' -E 's/find_package\(OpenCV [0-9.]+/find_package(OpenCV/' CMakeLists.txt Thirdparty/DBoW2/CMakeLists.txt
+# Binary vocabulary: parsing the 145 MB ORBvoc.txt takes ~3 min on macOS (longer while the service is busy, past
+# vslam.py's start limit); ORBvoc.bin (step 4) loads in about a second. System.cc picks the loader by extension.
+if ! grep -q loadFromBinaryFile Thirdparty/DBoW2/DBoW2/TemplatedVocabulary.h; then
+  patch -p1 -N < "$REPO/deploy/orbslam3_binary_vocabulary.patch" || fail "ORB-SLAM3: binary vocabulary patch did not apply"
+fi
 for d in Thirdparty/DBoW2 Thirdparty/g2o; do
   cmake -S "$d" -B "$d/build" -DCMAKE_BUILD_TYPE=Release -DOpenCV_DIR="$OPENCV_DIR" -DEigen3_DIR="$EIGEN_DIR" \
     -DCMAKE_CXX_FLAGS="$COMPAT" \
@@ -119,6 +125,15 @@ fi
 step "4/7 ORB vocabulary"
 if [ ! -f "$PREFIX/ORBvoc.txt" ]; then
   tar -xzf Vocabulary/ORBvoc.txt.tar.gz -C "$PREFIX" || fail "could not unpack Vocabulary/ORBvoc.txt.tar.gz"
+fi
+if [ ! -f "$PREFIX/ORBvoc.bin" ]; then
+  mkdir -p "$PREFIX/bin"
+  c++ -std=c++17 -O2 $COMPAT -I"$SRC/ORB_SLAM3" -I"$(brew --prefix opencv@4)/include/opencv4" \
+    "$REPO/deploy/orbvoc_to_bin.cc" "$SRC/ORB_SLAM3/Thirdparty/DBoW2/lib/libDBoW2.dylib" \
+    -L"$(brew --prefix opencv@4)/lib" -lopencv_core -Wl,-rpath,"$SRC/ORB_SLAM3/Thirdparty/DBoW2/lib" \
+    -o "$PREFIX/bin/orbvoc_to_bin" || fail "vocabulary: could not build deploy/orbvoc_to_bin.cc"
+  # loads the text vocabulary (the slow part, once), writes the binary one, checks it is the same tree
+  "$PREFIX/bin/orbvoc_to_bin" "$PREFIX/ORBvoc.txt" "$PREFIX/ORBvoc.bin" || fail "vocabulary: ORBvoc.bin conversion failed"
 fi
 
 step "5/7 Boost.Python for Python $PYDOT"
@@ -186,12 +201,15 @@ cd "$REPO"
 import orbslam3, pathlib, tempfile
 from vision_service.vslam import settings_yaml
 cfg = settings_yaml(pathlib.Path(tempfile.mkdtemp()) / "cam.yaml", 640, 480, 80.0)
-s = orbslam3.System("$PREFIX/ORBvoc.txt", str(cfg), orbslam3.Sensor.MONOCULAR)
-s.set_use_viewer(False); s.initialize(); s.shutdown()
-print("orbslam3 OK")
+import time
+s = orbslam3.System("$PREFIX/ORBvoc.bin", str(cfg), orbslam3.Sensor.MONOCULAR)
+t0 = time.monotonic()
+s.set_use_viewer(False); s.initialize()
+print(f"orbslam3 OK: started with ORBvoc.bin in {time.monotonic() - t0:.1f} s")
+s.shutdown()
 PYEOF
 
 echo
 echo "Done. Restart the vision service; GET /v1/nav/state should show vslam backend \"orbslam3\"."
-echo "Vocabulary: $PREFIX/ORBvoc.txt (VS_ORB_VOCAB). Calibrate the camera for best results:"
+echo "Vocabulary: $PREFIX/ORBvoc.bin (VS_ORB_VOCAB). Calibrate the camera for best results:"
 echo "  fx/fy/cx/cy and k1 k2 p1 p2 in vslam.settings_yaml are only estimated from the 80 deg field of view."

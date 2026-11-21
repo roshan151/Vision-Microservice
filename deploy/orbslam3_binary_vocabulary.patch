@@ -1,0 +1,164 @@
+diff -ruN a/Thirdparty/DBoW2/DBoW2/TemplatedVocabulary.h b/Thirdparty/DBoW2/DBoW2/TemplatedVocabulary.h
+--- a/Thirdparty/DBoW2/DBoW2/TemplatedVocabulary.h
++++ b/Thirdparty/DBoW2/DBoW2/TemplatedVocabulary.h
+@@ -22,6 +22,9 @@
+ #include <vector>
+ #include <numeric>
+ #include <fstream>
++#include <cstring>
++#include <iterator>
++#include <iostream>
+ #include <string>
+ #include <algorithm>
+ #include <opencv2/core/core.hpp>
+@@ -247,6 +250,21 @@
+   void saveToTextFile(const std::string &filename) const;  
+ 
+   /**
++   * Loads the vocabulary from a binary file written by saveToBinaryFile: the same tree as
++   * loadFromTextFile gives, in seconds instead of minutes (robot vision: ORBvoc.bin)
++   * @param filename
++   * @return false if the file cannot be read or is not such a file
++   */
++  bool loadFromBinaryFile(const std::string &filename);
++
++  /**
++   * Saves the vocabulary into a binary file (see loadFromBinaryFile)
++   * @param filename
++   * @return false if it could not be written
++   */
++  bool saveToBinaryFile(const std::string &filename) const;
++
++  /**
+    * Saves the vocabulary into a file
+    * @param filename
+    */
+@@ -1449,6 +1467,105 @@
+ }
+ 
+ // --------------------------------------------------------------------------
++// Binary vocabulary: "ORBVOCB1", int32 k L scoring weighting, uint32 nodes (without the root),
++// int32 descriptor type and columns (one row), then per node in order: int32 parent,
++// uint8 is-word, the descriptor's bytes, float64 weight. Native byte order.
++
++template<class TDescriptor, class F>
++bool TemplatedVocabulary<TDescriptor,F>::saveToBinaryFile(const std::string &filename) const
++{
++  if(m_nodes.size() < 2) return false;
++  const cv::Mat &d0 = m_nodes[1].descriptor;
++  const int32_t dtype = d0.type(), dcols = d0.cols;
++  const size_t dbytes = d0.total() * d0.elemSize();
++  std::ofstream f(filename.c_str(), std::ios::out | std::ios::binary | std::ios::trunc);
++  if(!f) return false;
++  const int32_t head[4] = {m_k, m_L, (int32_t)m_scoring, (int32_t)m_weighting};
++  const uint32_t n = (uint32_t)(m_nodes.size() - 1);
++  f.write("ORBVOCB1", 8);
++  f.write((const char*)head, sizeof(head));
++  f.write((const char*)&n, sizeof(n));
++  f.write((const char*)&dtype, sizeof(dtype));
++  f.write((const char*)&dcols, sizeof(dcols));
++  for(size_t i = 1; i < m_nodes.size(); ++i)
++  {
++    const Node &node = m_nodes[i];
++    const cv::Mat &d = node.descriptor;
++    if(d.rows != 1 || d.type() != dtype || d.cols != dcols || !d.isContinuous()) return false;
++    const int32_t parent = (int32_t)node.parent;
++    const uint8_t word = node.word_id < m_words.size() && m_words[node.word_id] == &node;
++    const double weight = node.weight;
++    f.write((const char*)&parent, sizeof(parent));
++    f.write((const char*)&word, sizeof(word));
++    f.write((const char*)d.data, dbytes);
++    f.write((const char*)&weight, sizeof(weight));
++  }
++  return (bool)f;
++}
++
++// --------------------------------------------------------------------------
++
++template<class TDescriptor, class F>
++bool TemplatedVocabulary<TDescriptor,F>::loadFromBinaryFile(const std::string &filename)
++{
++  std::ifstream f(filename.c_str(), std::ios::in | std::ios::binary);
++  if(!f) return false;
++  std::vector<char> buf((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
++  const size_t head = 8 + 4 * sizeof(int32_t) + sizeof(uint32_t) + 2 * sizeof(int32_t);
++  if(buf.size() < head || std::memcmp(buf.data(), "ORBVOCB1", 8) != 0)
++  {
++    std::cerr << "Vocabulary loading failure: This is not a binary vocabulary file!" << endl;
++    return false;
++  }
++  const char *p = buf.data() + 8;
++  int32_t hk, hL, n1, n2, dtype, dcols; uint32_t n;
++  std::memcpy(&hk, p, 4); std::memcpy(&hL, p + 4, 4); std::memcpy(&n1, p + 8, 4); std::memcpy(&n2, p + 12, 4);
++  std::memcpy(&n, p + 16, 4); std::memcpy(&dtype, p + 20, 4); std::memcpy(&dcols, p + 24, 4);
++  p = buf.data() + head;
++  const size_t dbytes = (size_t)CV_ELEM_SIZE(dtype) * (size_t)std::max(dcols, 0);
++  const size_t rec = sizeof(int32_t) + 1 + dbytes + sizeof(double);
++  if(hk < 0 || hk > 20 || hL < 1 || hL > 10 || n1 < 0 || n1 > 5 || n2 < 0 || n2 > 3 || dcols <= 0 ||
++     buf.size() != head + (size_t)n * rec)
++  {
++    std::cerr << "Vocabulary loading failure: This binary vocabulary file is damaged!" << endl;
++    return false;
++  }
++  m_k = hk; m_L = hL;
++  m_scoring = (ScoringType)n1;
++  m_weighting = (WeightingType)n2;
++  createScoringObject();
++
++  m_words.clear();
++  m_nodes.clear();
++  m_nodes.resize((size_t)n + 1);
++  m_nodes[0].id = 0;
++  for(NodeId nid = 1; nid <= n; ++nid, p += rec)
++  {
++    Node &node = m_nodes[nid];
++    int32_t pid;
++    std::memcpy(&pid, p, 4);
++    if(pid < 0 || (NodeId)pid >= nid)
++    {
++      std::cerr << "Vocabulary loading failure: This binary vocabulary file is damaged!" << endl;
++      m_nodes.clear();
++      return false;
++    }
++    node.id = nid;
++    node.parent = (NodeId)pid;
++    m_nodes[pid].children.push_back(nid);
++    node.descriptor.create(1, dcols, dtype);
++    std::memcpy(node.descriptor.data, p + 5, dbytes);
++    std::memcpy(&node.weight, p + 5 + dbytes, sizeof(double));
++    if(p[4])
++    {
++      node.word_id = (WordId)m_words.size();
++      m_words.push_back(&node);
++    }
++  }
++  return true;
++}
++
++// --------------------------------------------------------------------------
+ 
+ template<class TDescriptor, class F>
+ void TemplatedVocabulary<TDescriptor,F>::save(const std::string &filename) const
+diff -ruN a/src/System.cc b/src/System.cc
+--- a/src/System.cc
++++ b/src/System.cc
+@@ -115,7 +115,8 @@
+         cout << endl << "Loading ORB Vocabulary. This could take a while..." << endl;
+ 
+         mpVocabulary = new ORBVocabulary();
+-        bool bVocLoad = mpVocabulary->loadFromTextFile(strVocFile);
++        bool bVocLoad = (strVocFile.size() > 4 && strVocFile.compare(strVocFile.size() - 4, 4, ".bin") == 0
++            ? mpVocabulary->loadFromBinaryFile(strVocFile) : mpVocabulary->loadFromTextFile(strVocFile));
+         if(!bVocLoad)
+         {
+             cerr << "Wrong path to vocabulary. " << endl;
+@@ -137,7 +138,8 @@
+         cout << endl << "Loading ORB Vocabulary. This could take a while..." << endl;
+ 
+         mpVocabulary = new ORBVocabulary();
+-        bool bVocLoad = mpVocabulary->loadFromTextFile(strVocFile);
++        bool bVocLoad = (strVocFile.size() > 4 && strVocFile.compare(strVocFile.size() - 4, 4, ".bin") == 0
++            ? mpVocabulary->loadFromBinaryFile(strVocFile) : mpVocabulary->loadFromTextFile(strVocFile));
+         if(!bVocLoad)
+         {
+             cerr << "Wrong path to vocabulary. " << endl;

@@ -83,6 +83,7 @@ class HealthResponse(BaseModel):
     vlm: list[str] = []
     queue_depth: int
     uptime_s: float
+    vslam: dict = {}                  # visual SLAM: backend, ready, reason (vslam.MonoVSLAM.state)
 
 
 class ErrorResponse(BaseModel):

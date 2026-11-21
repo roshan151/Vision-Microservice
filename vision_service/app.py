@@ -53,6 +53,7 @@ async def lifespan(app: FastAPI):
         size_m=settings.slam_size_m, res=settings.slam_res_m, robot_radius=settings.robot_radius_m))
     app.state.follow = FollowSession()
     app.state.nav = NavSession()                      # global map, Theta*, visual SLAM (nav_api.py)
+    app.state.nav.vslam.warm_up(settings.debug_dir)   # ORB-SLAM3 loads now, not on the first frame
     app.state.started_at = time.monotonic()
     log.info(
         "ready in %.1fs — backend=%s versions=%s gallery=%s",
@@ -129,6 +130,7 @@ async def healthz(request: Request) -> HealthResponse:
         vlm=st.vlm.available(),
         queue_depth=st.runner.queue_depth,
         uptime_s=round(time.monotonic() - st.started_at, 1),
+        vslam=st.nav.vslam.state(),
     )
 
 

@@ -35,6 +35,7 @@ ORB-SLAM3 is a native library. Install it with deploy/install_orbslam3_macos.sh;
 from __future__ import annotations
 
 import io
+import json
 import logging
 import math
 import os
@@ -42,11 +43,12 @@ import threading
 import time
 from collections import OrderedDict, deque
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Optional, Sequence, Tuple
 
 import numpy as np
 
 log = logging.getLogger(__name__)
+WARM_T = -1.0                    # the warm-up frame's timestamp (the robot's are its monotonic clock: positive)
 
 MIN_PAIRS = 30                  # frames with both a SLAM pose and an odometry pose before fitting
 MIN_SPREAD_M = 0.8              # ...over at least this much odometry spread
@@ -337,6 +339,7 @@ class MonoVSLAM:
         self.backend, self.reason = "none", ""
         self._orb = None
         self._sys = None
+        self._size: Optional[Tuple[int, int]] = None       # the frame size it was built for
         self._frames: OrderedDict = OrderedDict()          # t -> (odom pose, pan, tilt)
         self._pairs: deque = deque(maxlen=600)             # (slam R_wc, p_wc, pan, tilt, odom pose in map frame)
         self._sim = None                                   # (s, R, t): SLAM world -> map frame
@@ -381,8 +384,34 @@ class MonoVSLAM:
         self._slot = (jpeg, t, tuple(odom_pose), pan_deg, tilt_deg, tof)
         self._ev.set()
 
+    def warm_up(self, debug_dir: Path, long_edge: int = 640) -> None:
+        """Load ORB-SLAM3 now, not on the robot's first frame: the vocabulary took 119 s to load (Nov 20), the whole
+        of a follow, and every frame meanwhile was dropped. Fed the newest camera picture of the latest debug run,
+        scaled as the robot streams them (FrameStream: long edge 640), so the settings it is built with (from this
+        frame's size) fit the real frames; grey at 640 x 360 without one. One frame cannot start a monocular map."""
+        if self.backend != "orbslam3":                     # PyMonoVO loads at once, and would take this frame and
+            return                                         # the robot's first as consecutive: one wild motion step
+        from PIL import Image
+        img = None
+        try:
+            latest = json.loads((debug_dir / "latest.json").read_text()).get("session")
+            pics = sorted((debug_dir / str(latest)).glob("*.jpg")) if latest else []
+            if pics:
+                img = Image.open(pics[-1]).convert("RGB")
+                log.info("vslam: warming up on %s", pics[-1])
+        except (OSError, ValueError) as exc:
+            log.info("vslam: no debug picture to warm up on (%s): grey", exc)
+        if img is None:
+            img = Image.new("RGB", (long_edge, long_edge * 9 // 16), (128, 128, 128))
+        k = long_edge / max(img.size)
+        img = img.resize((round(img.size[0] * k), round(img.size[1] * k)))
+        buf = io.BytesIO()
+        img.save(buf, "JPEG", quality=70)
+        self.feed(buf.getvalue(), WARM_T, (0.0, 0.0, 0.0), 0.0, 0.0)
+        self.frames_in -= 1                                # not one of the robot's
+
     def state(self) -> dict:
-        return {"backend": self.backend, "reason": self.reason or None, "tracking": self.tracking,
+        return {"backend": self.backend, "ready": self._sys is not None, "reason": self.reason or None, "tracking": self.tracking,
                 "scaled": self._sim is not None, "scale_m_per_unit": None if self._sim is None else round(self._sim[0], 4),
                 "scale_source": self.scale_source, "tof_scale": None if self.tof_scale is None else round(self.tof_scale, 4),
                 "tof_frames": len(self._tof),
@@ -431,7 +460,7 @@ class MonoVSLAM:
                             sys_.set_use_viewer(False)
                     sys_.initialize()
                 else:
-                    sys_ = _OrbProcess(self.vocab, str(cfg))
+                    sys_ = _OrbProcess(self.vocab, str(cfg), timeout_s=300.0)   # loads at service start: no hurry
                 self._sys = sys_
                 log.info("vslam: ORB-SLAM3 monocular started (%dx%d, hfov %.0f)", w, h, self.hfov)
             except Exception as exc:
@@ -446,8 +475,23 @@ class MonoVSLAM:
     def _track(self, jpeg: bytes, t: float, odom, pan: float, tilt: float, tof: Optional[dict] = None) -> None:
         from PIL import Image
         img = np.asarray(Image.open(io.BytesIO(jpeg)).convert("L"))
+        size = (img.shape[1], img.shape[0])
+        if self._sys is not None and self._size and size != self._size and self.backend == "orbslam3":
+            # Built for another frame size (the warm-up's): its camera settings would be wrong. Rebuild once.
+            log.warning("vslam: frames are %dx%d, ORB-SLAM3 was built for %dx%d: restarting it", *size, *self._size)
+            self.record("slam_resize", frame=list(size), built=list(self._size))
+            try:
+                self._sys.shutdown()
+            except Exception:                              # noqa: BLE001
+                pass
+            self._sys = None
         if self._sys is None:
-            self._start(img.shape[1], img.shape[0])
+            self._start(*size)
+            self._size = size
+        if t == WARM_T:                                    # the warm-up frame: loaded, nothing to track or record
+            self._sys.process_image_mono(img, t)
+            log.info("vslam: %s ready (warm-up frame %dx%d)", self.backend, *size)
+            return
         self._frames[round(t, 4)] = (odom, pan, tilt)
         while len(self._frames) > 2000:
             self._frames.popitem(last=False)
@@ -621,14 +665,18 @@ class _OrbProcess:
         self._proc.start()
         self._lock = threading.Lock()
         end = time.monotonic() + timeout_s                 # the vocabulary takes a few seconds to load
+        t0 = time.monotonic()
         while not self._conn.poll(0.2):
             if not self._proc.is_alive() or time.monotonic() > end:
+                alive = self._proc.is_alive()
                 try:
                     self._proc.kill()
                 except Exception:
                     pass
-                raise RuntimeError(f"ORB-SLAM3 process did not start (exit code {self._proc.exitcode})")
+                raise RuntimeError(f"ORB-SLAM3 process did not start: still loading after {timeout_s:.0f} s, killed"
+                                   if alive else f"ORB-SLAM3 process did not start: exited with code {self._proc.exitcode}")
         kind, value = self._conn.recv()
+        log.info("vslam: ORB-SLAM3 process %s after %.0f s", "ready" if kind == "ready" else "failed", time.monotonic() - t0)
         if kind == "err":
             try:
                 self._proc.kill()
